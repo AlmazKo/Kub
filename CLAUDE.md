@@ -10,9 +10,10 @@ flame graphs (notified on completion). Data comes from
 secret *values* are never shown on screen; mutating actions go through a prod-flagged confirm that
 shows the exact command.
 
-**Name & branding.** "Kub" = *Cub* + *Kubernetes*. The mascot is a low-poly polar bear cub with
+**Name & branding.** "Kub" = *Cub* + *Kubernetes* (K8s + cub). The mascot is a low-poly polar bear cub with
 Kubernetes-wheel paw pads (About artwork, `Kub/Resources/AboutHero.png`); the About slogan
 "The bear necessities of Kubernetes." puns on Baloo's "Bare Necessities" (bear + minimal viewer).
+"bear" is deliberate — never "fix" it to "bare" (it once was, by mistake).
 Keep the bear/minimalism wordplay in future branding copy (icons, taglines, release notes).
 
 ## Build / run / verify
@@ -56,8 +57,12 @@ open .xcbuild/Build/Products/Debug/Kub.app
 ## Architecture (`Kub/`)
 
 - `main.swift` — `NSApplication` bootstrap (programmatic, no storyboard/`@main`).
-- `AppDelegate.swift` — main menu (incl. **Settings… ⌘,**), About panel, Dock icon; `applicationDidFinishLaunching` seeds the default enabled kinds + registers the diagnostics-completion `Notifier`; `applicationWillTerminate` → `windowController.shutdown()` (kill child processes on Cmd-Q).
-- `Settings.swift` / `SettingsWindowController.swift` — UserDefaults-backed `Settings` store + the ⌘, window (**JDK integration** toggle + the heap-dump folder picker).
+- `AppDelegate.swift` — main menu (incl. **Settings… ⌘,**; View: Refresh ⌘R, Hide System Namespaces ⌘⇧K, Show Details ⌘⇧D, Wrap Detail Lines), Dock icon; `applicationDidFinishLaunching` seeds the default enabled kinds + registers the diagnostics-completion `Notifier`; `applicationWillTerminate` → `windowController.shutdown()` (kill child processes on Cmd-Q).
+- `Settings.swift` / `SettingsWindowController.swift` — UserDefaults-backed `Settings` store (+ `wrapDetailText`, toggled from the View menu, posts `.kubWrapDetailTextChanged`) + the ⌘, window (**JDK integration** toggle + the heap-dump folder picker).
+- `AboutWindowController.swift` — the custom About window (`AboutHeroView` artwork + slogan).
+- `PodShellView.swift` — the **Shell** tab: SwiftTerm `kubectl exec -it` into the app container, behind a connect overlay (prod warning); killed on tab/row change.
+- `CellCopyMenu.swift` — "Copy <Column>" items in every table's context menu. `TableMessageLabel.swift` — the centered loading/empty/error card with an optional action button.
+- `NodePodsView.swift` / `NamespaceInventoryView.swift` — the node **Pods** and namespace **Resources** detail tables.
 - `MainWindowController.swift` — window, toolbar (context picker + customize + group/**bookmarks**/details/**port-forwards**/**tasks**/refresh + search), `NSSplitViewController` (full-height sidebar), binds the view model, confirm popovers, detail-panel coordination + **live-log stream** + **metrics scrape** + **diagnostics tasks** (surfaced in the **Tasks** dropdown + a completion notification), context color band, window sizing. `shutdown()` tears down every child process/task.
 - `SidebarViewController.swift` — flat source-list of `ResourceKind`s (element counts, one thin **enabled/disabled divider**, drag-to-reorder / cross-divider show-hide). No section headers, no pinned-kinds section (namespace bookmarks live in the table now).
 - `ResourceListViewController.swift` — the main table (one `ResourceKind` across all namespaces), **grouped by a chosen dimension** (`GroupBy`: namespace / status / node / workload — toggled from the toolbar **Group** island, collapsible groups with resource-type header icons), sortable + reorder/show-hide columns (autosaved per kind) + **content-fit-on-open** (`ColumnFit`), a clickable **namespace-bookmark paw**, **type-to-search** (`SpeedSearchTableView`), per-row mini actions, a rich **row context menu** (delete/restart, scale, roll back, port-forward, bookmark namespace), bottom status bar, centered empty/error/loading text, and the bottom detail split.
@@ -67,10 +72,11 @@ open .xcbuild/Build/Products/Debug/Kub.app
 - `ColumnFit.swift` — text-measures columns to their content (header + widest cell) for compact-on-open sizing.
 - `StatusCellView.swift` — status icon+text cell (the health icon lives in the **Status** column, not next to the name), `configureNamespace` (bolder+dimmer), `MiniActionCell` (row button), and `BadgeCellView`/`ArchBadge` (colored capsule for CPU arch).
 - `ConfirmPopover.swift` — transient, **opaque** `NSPopover` confirm for mutating actions (replaces the old NSAlert `ConfirmDialog`); key/value grid, prod-only warning, optional stepper, and a **live monospaced preview of the exact command** (updates as the stepper changes); anchored to the triggering row/pane. The Context row shows the context's **emoji + color** when the user customized it (an optional per-value color in the detail-row model).
-- `LiveLogView.swift` — live `logs -f` view: `LogFormatter` render + filter, **Wrap / Time / Follow(auto-scroll)** toggles, pause/clear, 50k-line cap (chunk-trimmed) with non-contiguous layout for scroll perf; `LogPump` coalesces off-main lines into batched main-thread flushes. **Follow auto-suspends** when the user live-scrolls up off the tail and resumes when they scroll back to the bottom (via `NSScrollView.didLiveScroll` — user-driven only, so our own scrollToEnd / resize don't toggle it).
+- `LiveLogView.swift` — live `logs -f` view: `LogFormatter` render + filter, **Wrap / Time / Follow(auto-scroll)** toggles, pause/clear, 50k-line cap (chunk-trimmed) with non-contiguous layout for scroll perf; `LogPump` coalesces off-main lines into batched main-thread flushes. **Follow auto-suspends** on the first user scroll off the tail (`NSScrollView.didLiveScroll` + a `scrollWheel` hook for legacy wheels — user-driven only, so our own scrollToEnd / resize don't toggle it) and comes back only via the Follow checkbox.
 - `PortForward.swift` — `PortForwardController` (@MainActor): session model + start popover (local/remote ports) + sessions-list popover (status, open-in-browser, copy, stop).
 - `ActivityController.swift` — `ActivityController` (@MainActor): the **Tasks** toolbar dropdown listing in-flight long diagnostics (heap dump / profile) with a progress bar (determinate for profiles, indeterminate for heap dumps) + elapsed time + Stop; a 0.5s ticker refreshes rows while the popover is open. Both this and Port-forwards are disabled while their list is empty.
-- `Diagnostics.swift` — `AsyncProfile` presets, `ProcessAction`, `DiagnosticPaths` (async-profiler tar resolved from the **app bundle**), `LocalProcess`.
+- `Diagnostics.swift` — `AsyncProfile` presets, `ProcessAction`, `DiagnosticPaths` (async-profiler tar resolved from the **app bundle**, one per Linux arch), `LocalProcess`.
+- `PodContainers.swift` — `PodContainers.main(of:)`: the **app container** a process-level action (ps / exec / cp / shell) targets — the `kubectl.kubernetes.io/default-container` annotation, else the first non-sidecar-looking container. Resolved + cached per pod by `ClusterViewModel.mainContainer`.
 - `Notifier.swift` — `Notifier` (`@unchecked Sendable`, `UNUserNotificationCenterDelegate`): a local notification when a heap dump / profile finishes; clicking it reveals the artifact in Finder. Gated on **live** authorization (`canDeliver()`), else the caller falls back to the reveal popover.
 - `Metrics.swift` — Prometheus `/metrics` model + `PrometheusParser` (text exposition — CRLF, `+Inf`/`-Inf`/`NaN`, quoted labels, trailing timestamps) + `MetricsDiscovery` (endpoint resolution) + `MetricsSources`.
 - `MetricsView.swift` — the **Metrics** detail tab (pods): a filterable, sortable table (metric / labels / value; TYPE+HELP on hover) + an editable `port`/`path` + Load toolbar for a manual override.
@@ -89,15 +95,16 @@ driven by `ClusterViewModel`'s `on*Changed` closures.
 ## Key conventions & invariants
 
 - **kubectl behind a protocol.** All cluster access goes through `KubeService`; `KubectlClient`
-  shells out (`get -A -o json`, `get pod -o json`, `delete`, `rollout restart|undo|history`,
-  `scale`, `describe`, `logs`(+`-f`), `port-forward`, `get events`, `get -o name` for counts,
-  `exec`/`cp` for diagnostics). Swappable for a native client later — keep UI/VM kubectl-agnostic.
+  shells out (`get -A -o json`, `get pod -o json`, `get --raw <apiPath>?limit=1` for counts,
+  `get secrets --no-headers` (Table), `delete`, `rollout restart|undo|history`, `scale`, `describe`,
+  `logs -f`, `port-forward`, `get events`, `top`, `exec`/`cp` for diagnostics; the Shell's `exec -it`
+  runs in SwiftTerm). Swappable for a native client later — keep UI/VM kubectl-agnostic.
 - **Swift 6 strict concurrency.** UI types are `@MainActor`. `KubeService` is `Sendable`; models are
-  `Sendable` value types. Non-Sendable statics (NSFont, ISO formatters, `LogFormatter`/`DescribeFormatter`)
-  are created locally per call. Streaming/`@unchecked Sendable` helpers (`KubectlProcess`, `LogPump`,
+  `Sendable` value types. Date parsing/formatting uses shared `static` `Date.FormatStyle`s in `Age`
+  (Sendable); non-Sendable objects (NSFont, `LogFormatter`/`DescribeFormatter`) are created per call. Streaming/`@unchecked Sendable` helpers (`KubectlProcess`, `LogPump`,
   `DataBox`) guard their state with an `NSLock` and marshal to `@MainActor` via `DispatchQueue.main.async`.
 - **Generic resource model.** Adding a kind = (1) `ResourceKind` case + `displayName`/`singularName`/
-  `kubectlResource`/`symbol`/`section`/`primaryAction`/`columns` in `Domain.swift` (most switches are
+  `kubectlResource`/`apiKind`/`apiPath`/`symbol`/`primaryAction`/`columns` in `Domain.swift` (most switches are
   exhaustive — the compiler lists what to fill), (2) a `Decodable` struct in `Models.swift`, (3) a
   `Derive.<kind>` in `PodStatus.swift` returning a `ResourceRow`, (4) a `case` in
   `KubectlClient.resources(kind:context:)`. `primaryAction` is optional; add `.scalable` / `.rollbackable`
@@ -108,15 +115,34 @@ driven by `ClusterViewModel`'s `on*Changed` closures.
   a `DetailSection` case (+ `.title`) + a branch in `ClusterViewModel.detailText` (or a dedicated
   content view) + a `setText`/`show(...)` route in `DetailPaneView`. The switches are exhaustive —
   don't fold a new case into a grouped arm that returns empty. Pods: Overview / **Why** / **Containers** /
-  Logs (live) / Events / **Metrics** / Top. Controllers: Overview / **History** / Events.
+  Mounts / Logs (live) / Shell / Events / **Metrics** / Top. Controllers: Overview / **History** / Events.
+  Nodes: Overview / Pods. Namespaces: Overview / Resources.
 - **Metrics tab (pods).** `podMetrics(for:override:)` scrapes a pod's Prometheus `/metrics` over an
   **ephemeral `kubectl port-forward` + local HTTP GET** (the kubelet path — the API-server pod proxy
   hangs on the user's EKS). The port-forward is torn down on success/error/timeout/cancellation; the
   exposition text is parsed **off the main actor** (`Task.detached`). Endpoint discovery order (first
   "confident" hit is scraped automatically, else the guess is pre-filled and waits for Load): a
   **ServiceMonitor/PodMonitor** that targets the pod (authoritative — exact port+path, resolving
-  SM→Service→pod and port-name→targetPort) → `prometheus.io/port`+`/path` → a container port named
-  `*metrics*`/`*prom*` → a best-effort guess (management/http port → first port → 8080).
+  SM→Service→pod and port-name→targetPort; monitors are listed **cluster-wide** and filtered by their
+  `namespaceSelector`, since kube-prometheus keeps them in `monitoring`) → `prometheus.io/port`+`/path` on
+  the pod, then on a Service that selects it → a container port named `*metrics*`/`*prom*` → a best-effort
+  guess (management/http port → first port → 8080).
+- **Process-level actions pin the app container.** `ps` (Top tab), `exec`/`cp` (heap dump, profile) and
+  the Shell all pass `-c <PodContainers.main>`: kubectl's default is the *first* container, which in an
+  injected pod is the sidecar, and a PID from one container's list means nothing in another's. Every
+  step of one diagnostic must use the same container.
+- **Events are selected by name AND kind** (`involvedObject.name=…,involvedObject.kind=<apiKind>`): a
+  Deployment, its Service and its HPA share a name, and name alone mixed their events.
+- **Sidebar counts** use `get --raw <apiPath>?limit=1` and `metadata.remainingItemCount` (~2KB) instead of
+  `-o name` (which downloads every object); `-o name` is only the fallback when the field is absent.
+- **Secrets are never fetched as JSON** — not in the Secrets table, not in the namespace inventory
+  (`NamespaceInventory.queryKinds` excludes them). `secretRows` reads the server-side Table
+  (`get secrets --no-headers`), and kubectl prints only the cells, so values never reach Kub's process
+  (a `last-applied-configuration` annotation can still carry them into kubectl's own memory). Age comes
+  humanized from kubectl (`humanizedSeconds` approximates it for sorting; `created` is `—`).
+- **Multi-container logs stream with `--prefix`** (when the READY total > 1) and `--max-log-requests=50`
+  (kubectl's default 5 rejects a pod with a few sidecars outright). `LiveLogView.stripTimestamp` skips the
+  `[pod/…/container]` tag before looking for the `--timestamps` stamp.
 - **Diagnostics completion notifications.** A finished heap dump / profile posts a `UNUserNotification`
   (click → reveal in Finder). `runDiagnostic` uses it **only when `Notifier.canDeliver()`** (live
   authorization) is true; otherwise it falls back to the row-anchored reveal popover, so the artifact
@@ -139,20 +165,23 @@ driven by `ClusterViewModel`'s `on*Changed` closures.
   diagnostics: when off, the process **Top** tab's right-click "JDK" submenu (Heap Dump / Profile) doesn't
   appear. The menu reads the setting fresh each right-click.
 - **Mutations always confirm.** delete / restart / **scale** / **rollback** / heap-dump / profile go
-  through `ConfirmPopover` (prod/remote flagged → Return defaults to Cancel). Polling is **paused**
+  through `ConfirmPopover` (prod context or an irreversible delete → Return defaults to Cancel; PVC/PV
+  deletes require typing the name). Polling is **paused**
   around the popover (`pauseForConfirm`/`resumeAfterConfirm`) because it's anchored to a table row.
 - **Streaming processes** (`logs -f`, `port-forward`) use `Kubectl.stream` → `KubectlProcess`, which
   runs **outside** the concurrency gate (a stream would otherwise hold a slot forever) and is
   **stoppable**. Every stream handle must be torn down on section/row change, details-off, minimize,
   window close, **and app terminate** (via `shutdown()`), or child kubectl processes orphan to launchd
-  and leak bound ports.
-- **Secret values are never shown.** Secrets/ConfigMaps display only key counts; the "Why" tab reads
-  only status reasons. (A future decode-to-clipboard must stay explicit-consent, off-screen.)
+  and leak bound ports. The Shell's SwiftTerm `exec -it` (`PodShellView`) follows the same teardown via
+  `stopDetailShell()`.
+- **Secret values are never shown.** The Secrets table shows key counts; Overview (`describe`) shows key
+  names + byte sizes; the "Why" tab reads only status reasons. ConfigMap data isn't secret and is shown. (A future decode-to-clipboard must stay explicit-consent, off-screen.)
 - **Polling model.** The *visible* kind polls every **5s**; *other* kinds' sidebar counts every **60s**
   (`loadCount` reuses fresh cached data). The Top tab live-polls every ~3s. Auto-refresh + counts pause
   during a confirm. Pod arch is joined from a **60s-TTL `nodeArchCache`** so it never rides the 5s poll.
-- **Per-context caches** (`rowCache`/`countCache`/`nodeArchCache`, keyed by context): switching contexts
-  (or kinds) shows cached data instantly, then refreshes. Namespace bookmarks (`PinnedNamespaces`) are per-context too.
+- **Per-context caches** (`rowCache`/`countCache`/`nodeArchCache`, keyed by context; `detailCache` and
+  `mainContainerCache` keyed by context+object, 5-min `cacheTTL`): switching contexts (or kinds) shows
+  cached data instantly, then refreshes. Namespace bookmarks (`PinnedNamespaces`) are per-context too.
 - **Events "unread" badge.** The Events sidebar counter shows `+N` new events since you last viewed the
   Events tab (per-context `seenEventKeys` baseline, event identity = `metadata.name` fresh from
   `eventKeys`, on the 60s counts cadence), hidden while Events is the visible kind. See the state-machine
@@ -164,7 +193,21 @@ driven by `ClusterViewModel`'s `on*Changed` closures.
 
 - **EKS exec-auth needs PATH.** GUI launches get a minimal `PATH` without `/opt/homebrew/bin` /
   `/usr/local/bin`, so kubectl can't find the `aws` exec-credential plugin. `Kubectl.augmentedEnvironment()`
-  augments `PATH` on every spawned process (one-shot **and** streaming) — keep that.
+  augments `PATH` on every spawned process (one-shot **and** streaming) with the fixed locations **plus the
+  login shell's PATH** (`$SHELL -lc`, probed once, 3s cap — asdf/mise shims, `google-cloud-sdk/bin`, `~/.rd/bin`
+  live wherever dotfiles put them) — keep that.
+- **`-A` goes after the verb, `-n` may go before it.** `-n` is a global flag; `-A` belongs to `get`, and
+  `kubectl --context X -A get …` fails with "unknown shorthand flag". `optionalList` swallows errors, so
+  a misplaced `-A` there silently returns no ServiceMonitors.
+- **Pod STATUS/READY/RESTARTS are `PodStatusDerivation.summarize`** — a port of kubectl's `printPod`, verified
+  identical on live pods and edge cases (native sidecars, `NotReady`, `Init:*` restarts, `SchedulingGated`,
+  readiness gates). Change it only against `kubectl get pods` output, not from memory.
+- **`--request-timeout` does not bound `exec`/`cp`.** Verified: `--request-timeout=3s exec … sleep 7` runs to
+  completion. The only real cap on a hung exec/cp is the per-call `timeout:` watchdog in `Kubectl.run`
+  (SIGTERM→SIGKILL); don't "fix" a hang by adding the flag.
+- **JSON decoding stays off the main actor only while `SWIFT_APPROACHABLE_CONCURRENCY = NO`.** `KubectlClient`'s
+  `nonisolated async` methods hop to the cooperative pool; the Approachable-Concurrency flag flips that
+  (`NonisolatedNonsendingByDefault`) and would parse a 6MB `get pods -A -o json` on the main thread every 5s.
 - **Orphaned child processes on Cmd-Q.** `NSApplication.terminate` (Cmd-Q/Quit/Dock) does **not** fire
   `windowWillClose`, so teardown lives in `MainWindowController.shutdown()` called from **both**
   `windowWillClose` and `AppDelegate.applicationWillTerminate`. Without it, `port-forward`/`logs -f`
@@ -174,7 +217,8 @@ driven by `ClusterViewModel`'s `on*Changed` closures.
   (Events) push the trailing action button off-screen. Fit runs once per kind (gated on whether a
   saved autosave layout exists) so manual resizes stick.
 - **Labels can widen the resizable window.** Long-text labels (`statusLabel`, detail title) must use
-  `.defaultLow` horizontal compression resistance; the detail text view **wraps**; the centered
+  `.defaultLow` horizontal compression resistance; the detail text view doesn't wrap by default (View ▸
+  Wrap Detail Lines, `Settings.wrapDetailText`) and scrolls horizontally instead; the centered
   empty/error label is capped ≤460 with word wrapping.
 - **Window default size & autosave.** Default is **1200×720** and the **detail pane starts visible**
   (`showDetails` defaults on — `object(forKey:) as? Bool ?? true`). To change the default size, bump the
@@ -238,10 +282,13 @@ To change the icon, replace the PNGs in `AppIcon.appiconset`.
 The JVM diagnostics are grouped as an opt-out **JDK integration**, gated by
 `Settings.jdkIntegrationEnabled` (⌘, → "Enable JDK integration", default on). When enabled, right-click a
 process row in the pod **Top** tab → the **"JDK" submenu** (Heap Dump / Profile); when disabled the submenu
-doesn't appear. async-profiler ships **inside the app bundle** (`Kub/Resources/async-profiler-4.4-linux-x64.tar`,
-bundled by Xcode, resolved via `Bundle.main`, version string in `DiagnosticPaths.asyncProfilerVersion`)
-and is uploaded into the pod per run (linux/amd64 only). Heap dump locates the JVM's own `jcmd`. Both run on
-a separate `diag` gate so a multi-minute op can't starve polling; artifacts land in
+doesn't appear. async-profiler ships **inside the app bundle** (`Kub/Resources/async-profiler-4.4-linux-{x64,arm64}.tar`,
+bundled by Xcode, resolved via `Bundle.main`; `DiagnosticPaths.asyncProfilerTar(arch:)` picks the build from the
+pod row's node arch, unknown → x64) and is uploaded into the pod per run. Heap dump locates the JVM's own `jcmd`
+(next to `/proc/PID/exe`, `$JAVA_HOME/bin`, PATH — a **JRE-only image has none**, the error says so), then picks
+the first of `$TMPDIR`, `/tmp`, `/var/tmp`, cwd that is writable with ≥1.3× the JVM's RSS free (read-only root
+fs / ephemeral-storage eviction otherwise); the script prints the finished `.gz` path on its last stdout line,
+which is what gets `cp`'d. Both run on a separate `diag` gate so a multi-minute op can't starve polling; artifacts land in
 `/tmp/kub/profiles/<ns>/` (profiles) and `<Settings.heapDumpsDirectory>/<ns>/` (heap dumps — default
 `~/Downloads/Kub`, user-picked in ⌘,; Downloads costs a one-time TCC prompt, an open-panel pick doesn't). All are confirm-gated and prod-flagged. In-flight runs
 show progress in the **Tasks** toolbar dropdown and post a **completion notification** (click → reveal
@@ -262,6 +309,7 @@ never run them unless explicitly asked.
 - `Kub.xcodeproj` + its shared scheme (`xcshareddata/xcschemes/Kub.xcscheme`) and the bundled
   `Kub/Resources/*.tar` are committed; `xcuserdata` is not. Bundle id is `almazko.Kub`.
 - `.claude/` is gitignored; local settings never belong in a commit.
+- **SwiftTerm** (the Shell's terminal) is the one SPM dependency; `Package.resolved` is committed.
 
 ## Out of scope (room to grow)
 

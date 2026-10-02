@@ -46,7 +46,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         let b = NSButton(image: detailsImage(on: showDetails), target: self, action: #selector(toggleDetails(_:)))
         b.setButtonType(.pushOnPushOff)
         b.bezelStyle = .texturedRounded
-        b.toolTip = "Show detail panel (Overview / Logs / Events) — ⌘⇧D"
+        b.toolTip = "Show detail panel (⌘⇧D)"
         b.state = showDetails ? .on : .off
         return b
     }()
@@ -401,9 +401,23 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         // session for the same pod, switches it for a different pod. Leaving the
         // tab (any non-shell path below) ends the session.
         if section == .shell && row.kind == .pods {
-            resourceList.configureDetailShell(context: viewModel.selectedContext ?? "",
-                                              namespace: row.namespace, pod: row.name,
-                                              isProduction: contextIsDangerous)
+            // Target the app container, not whichever kubectl picks first (a sidecar in
+            // injected pods). Unknown yet → configure now, re-configure once resolved;
+            // the connect overlay gives that fetch time before the user presses Start.
+            let ctx = viewModel.selectedContext ?? ""
+            let container = viewModel.cachedMainContainer(namespace: row.namespace, pod: row.name)
+            resourceList.configureDetailShell(context: ctx, namespace: row.namespace, pod: row.name,
+                                              container: container, isProduction: contextIsDangerous)
+            if container == nil {
+                Task { [weak self] in
+                    guard let self,
+                          let resolved = await self.viewModel.mainContainer(namespace: row.namespace, pod: row.name),
+                          self.resourceList.detailSection == .shell,
+                          self.resourceList.selectedRow?.key == row.key else { return }
+                    self.resourceList.configureDetailShell(context: ctx, namespace: row.namespace, pod: row.name,
+                                                           container: resolved, isProduction: self.contextIsDangerous)
+                }
+            }
             return
         }
         resourceList.stopDetailShell()
@@ -687,10 +701,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             note = "This may also delete the underlying volume and its data (reclaim policy Delete). "
                  + "It cannot be undone."
         case .delete where irreversibleDelete:
-            note = "This \(row.kind.singularName) isn’t managed by a controller — it won’t come back until "
+            note = "This \(row.kind.displaySingular) isn’t managed by a controller — it won’t come back until "
                  + "you re-apply its manifest. Pods depending on it may fail to (re)start."
         case .delete:
-            note = "The \(row.kind.singularName) will be deleted."
+            note = "The \(row.kind.displaySingular) will be deleted."
         case .restart:
             // The consequence depends on the workload's (update) strategy, not a fixed line.
             switch row.cells["rollout"] {
@@ -710,7 +724,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         pauseForConfirm()
         ConfirmPopover.present(
             from: anchor, rect: rect, preferredEdge: .maxY,
-            title: "\(action.title) \(row.kind.singularName) “\(row.name)”?",
+            title: "\(action.title) \(row.kind.displaySingular) “\(row.name)”?",
             detail: confirmDetail(row.namespace),
             warning: warning, note: note,
             confirmTitle: action.title, danger: contextIsDangerous || irreversibleDelete,
@@ -744,7 +758,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         pauseForConfirm()
         ConfirmPopover.present(
             from: anchor, rect: rect, preferredEdge: .maxY,
-            title: "Scale \(row.kind.singularName) “\(row.name)”?",
+            title: "Scale \(row.kind.displaySingular) “\(row.name)”?",
             detail: confirmDetail(row.namespace),
             warning: contextWarning(),
             note: "Currently \(current) replica\(current == 1 ? "" : "s"). Scaling to 0 stops it.",
@@ -764,7 +778,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         pauseForConfirm()
         ConfirmPopover.present(
             from: anchor, rect: rect, preferredEdge: .maxY,
-            title: "Roll back \(row.kind.singularName) “\(row.name)”?",
+            title: "Roll back \(row.kind.displaySingular) “\(row.name)”?",
             detail: confirmDetail(row.namespace),
             warning: contextWarning(),
             note: "0 = previous rollout. See the History tab for revision numbers.",
@@ -819,6 +833,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         var detail = confirmDetail(ns)
         detail.append(("PID", action.pid, nil))
 
+        // The diagnostic runs in the app container (PodContainers.main) — show it.
+        let cFlag = viewModel.cachedMainContainer(namespace: ns, pod: pod).map { " -c \($0)" } ?? ""
         switch action.kind {
         case .heapDump:
             pauseForConfirm()
@@ -828,7 +844,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
                 detail: detail, warning: contextWarning(),
                 note: "\(shortCmd)\n\njcmd GC.heap_dump briefly pauses the JVM and writes the heap (can be GBs) into the pod, then copies it out.",
                 confirmTitle: "Heap Dump", danger: contextIsDangerous,
-                command: { _ in "kubectl exec \(pod) -n \(ns) -- jcmd \(action.pid) GC.heap_dump <dump>.hprof" },
+                command: { _ in "kubectl exec \(pod) -n \(ns)\(cFlag) -- jcmd \(action.pid) GC.heap_dump <dump>.hprof" },
                 onResult: { [weak self] result in
                     guard let self else { return }
                     self.resumeAfterConfirm()
@@ -849,7 +865,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
                 confirmTitle: "Start Profile", danger: contextIsDangerous,
                 stepper: .init(label: "Duration", unit: "sec", value: 60, min: 1, max: 3600, step: 10, presets: [30, 60, 120, 300]),
                 command: { secs in
-                    "kubectl exec \(pod) -n \(ns) -- asprof \(preset.asprofArgs(pid: action.pid, seconds: secs ?? 60, outPath: "<out>.jfr"))"
+                    "kubectl exec \(pod) -n \(ns)\(cFlag) -- asprof \(preset.asprofArgs(pid: action.pid, seconds: secs ?? 60, outPath: "<out>.jfr"))"
                 },
                 onResult: { [weak self] result in
                     guard let self else { return }
@@ -1016,8 +1032,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
 // MARK: - NSWindowDelegate
 
 extension MainWindowController: NSWindowDelegate {
-    // The Top tab live-polls kubectl every 3s; stop it when the window isn't
-    // visible so a backgrounded app doesn't keep hitting the cluster.
+    // Closing the window tears down every child process and task (see shutdown()).
     func windowWillClose(_ notification: Notification) {
         shutdown()
     }

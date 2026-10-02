@@ -3,94 +3,116 @@ import Foundation
 // MARK: - Age formatting (kubectl-like compact durations)
 
 enum Age {
+    /// The age column's text, hover tooltip and sort key from a single parse —
+    /// one parse of `creationTimestamp` per row instead of three.
+    struct Stamp {
+        let text: String       // "5m12s" / "3d4h"; "—" if unparseable
+        let absolute: String   // "Jul 3, 2026  07:13:28" (local); "—" if unparseable
+        let seconds: Double    // for sorting; 0 if unparseable
+    }
+
+    // FormatStyles are Sendable value types, so shared instances are fine under strict
+    // concurrency (ISO8601DateFormatter / DateFormatter aren't, and cost ~100µs to make).
+    private static let iso = Date.ISO8601FormatStyle()
+    private static let isoFractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)   // MicroTime (events)
+    private static let posix = Locale(identifier: "en_US_POSIX")
+    private static let absoluteStyle = Date.VerbatimFormatStyle(
+        format: "\(month: .abbreviated) \(day: .defaultDigits), \(year: .defaultDigits)  \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits):\(second: .twoDigits)",
+        locale: posix, timeZone: .autoupdatingCurrent, calendar: .autoupdatingCurrent)
+    private static let timeStyle = Date.VerbatimFormatStyle(
+        format: "\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits):\(second: .twoDigits)",
+        locale: posix, timeZone: .autoupdatingCurrent, calendar: .autoupdatingCurrent)
+    private static let dayTimeStyle = Date.VerbatimFormatStyle(
+        format: "\(month: .abbreviated) \(day: .defaultDigits)  \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits):\(second: .twoDigits)",
+        locale: posix, timeZone: .autoupdatingCurrent, calendar: .autoupdatingCurrent)
+
+    /// RFC 3339 as the API server writes it; the fractional form is tried second
+    /// because only MicroTime fields (`eventTime`, `lastObservedTime`) carry it.
     static func parse(_ s: String) -> Date? {
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        if let d = plain.date(from: s) { return d }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: s)
+        (try? iso.parse(s)) ?? (try? isoFractional.parse(s))
+    }
+
+    static func stamp(_ iso: String?, now: Date = Date()) -> Stamp {
+        guard let iso, let date = parse(iso) else { return Stamp(text: "—", absolute: "—", seconds: 0) }
+        let secs = seconds(since: date, now: now)
+        return Stamp(text: humanize(secs), absolute: absoluteStyle.format(date), seconds: secs)
     }
 
     static func format(_ iso: String?, now: Date = Date()) -> String {
         guard let iso, let date = parse(iso) else { return "—" }
-        return humanize(max(0, now.timeIntervalSince(date)))
+        return humanize(seconds(since: date, now: now))
     }
 
-    /// Age in seconds (for sorting). 0 if unparseable.
-    static func seconds(_ iso: String?, now: Date = Date()) -> Double {
-        guard let iso, let date = parse(iso) else { return 0 }
-        return max(0, now.timeIntervalSince(date))
+    static func seconds(since date: Date, now: Date = Date()) -> Double {
+        max(0, now.timeIntervalSince(date))
     }
 
     /// Absolute local timestamp: "HH:mm:ss" if it's today, "MMM d  HH:mm:ss"
     /// otherwise (so older events carry the day).
-    static func timestamp(_ iso: String?, now: Date = Date()) -> String {
-        guard let iso, let date = parse(iso) else { return "—" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = Calendar.current.isDate(date, inSameDayAs: now)
-            ? "HH:mm:ss"
-            : "MMM d  HH:mm:ss"
-        return formatter.string(from: date)
+    static func timestamp(_ date: Date, now: Date = Date()) -> String {
+        Calendar.current.isDate(date, inSameDayAs: now) ? timeStyle.format(date) : dayTimeStyle.format(date)
     }
 
+    /// kubectl's `duration.HumanDuration`: two units only while the coarse one is
+    /// small (`4m3s`, `2h5m`, `3d4h`, `2y5d`), one unit after that.
     static func humanize(_ seconds: TimeInterval) -> String {
-        let s = Int(seconds)
-        if s < 60 { return "\(s)s" }
+        let s = max(0, Int(seconds))
+        if s < 120 { return "\(s)s" }
         let m = s / 60
-        if m < 60 { return "\(m)m" }
+        if m < 10 { return s % 60 == 0 ? "\(m)m" : "\(m)m\(s % 60)s" }
+        if m < 180 { return "\(m)m" }
         let h = m / 60
-        if h < 24 { return h < 10 ? "\(h)h\(m % 60)m" : "\(h)h" }
+        if h < 8 { return m % 60 == 0 ? "\(h)h" : "\(h)h\(m % 60)m" }
+        if h < 48 { return "\(h)h" }
         let d = h / 24
-        if d < 365 { return d < 8 ? "\(d)d\(h % 24)h" : "\(d)d" }
+        if h < 24 * 8 { return h % 24 == 0 ? "\(d)d" : "\(d)d\(h % 24)h" }
+        if h < 24 * 365 * 2 { return "\(d)d" }
         let y = d / 365
-        return y < 8 ? "\(y)y\(d % 365)d" : "\(y)y"
-    }
-
-    /// Absolute creation date-time (local, to the second) for the age column's
-    /// hover tooltip — e.g. "Jul 3, 2026  07:13:28". "—" if unparseable.
-    static func absolute(_ iso: String?) -> String {
-        guard let iso, let date = parse(iso) else { return "—" }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "MMM d, yyyy  HH:mm:ss"
-        return f.string(from: date)
+        if h < 24 * 365 * 8 { return d % 365 == 0 ? "\(y)y" : "\(y)y\(d % 365)d" }
+        return "\(y)y"
     }
 }
 
 // MARK: - Kubernetes resource quantities
 
-/// Minimal parser for the Kubernetes quantity strings used in resource requests
-/// (e.g. "100m", "1", "128Mi", "1Gi"). Enough for summing and display.
+/// Parser for Kubernetes quantity strings (`resource.Quantity`): binary suffixes
+/// Ki…Ei, decimal n/u/m/k/M/G/T/P/E, and the exponent form (`1e3`). The API
+/// canonicalizes values, so `memory: 1.5` comes back as `1500m` and a tiny CPU
+/// request as `100n` — both must parse, or the column shows "—" and sorts as 0.
 enum Quantity {
-    static func cpuMillicores(_ s: String) -> Double? {
-        if s.hasSuffix("m") { return Double(s.dropLast()) }
-        if let v = Double(s) { return v * 1000 }
-        return nil
+    private static let suffixes: [(String, Double)] = [
+        ("Ki", 1024), ("Mi", 1048576), ("Gi", 1073741824), ("Ti", 1099511627776),
+        ("Pi", 1125899906842624), ("Ei", 1152921504606846976),
+        ("n", 1e-9), ("u", 1e-6), ("m", 1e-3), ("k", 1e3), ("M", 1e6), ("G", 1e9),
+        ("T", 1e12), ("P", 1e15), ("E", 1e18),
+    ]
+
+    /// The quantity as a plain number (cores for CPU, bytes for memory).
+    static func value(_ raw: String) -> Double? {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        for (suffix, mult) in suffixes where s.hasSuffix(suffix) {
+            // "1e3" ends in a digit, so the exponent form never reaches here.
+            return Double(s.dropLast(suffix.count)).map { $0 * mult }
+        }
+        return Double(s)   // plain number or exponent form ("1e3", "12E6")
     }
 
-    static func memoryBytes(_ s: String) -> Double? {
-        let units: [(String, Double)] = [
-            ("Ki", 1024), ("Mi", 1048576), ("Gi", 1073741824),
-            ("Ti", 1099511627776), ("Pi", 1125899906842624),
-            ("k", 1e3), ("M", 1e6), ("G", 1e9), ("T", 1e12), ("P", 1e15),
-        ]
-        for (suffix, mult) in units where s.hasSuffix(suffix) {
-            if let v = Double(s.dropLast(suffix.count)) { return v * mult }
-        }
-        return Double(s)
-    }
+    static func cpuMillicores(_ s: String) -> Double? { value(s).map { $0 * 1000 } }
+    static func memoryBytes(_ s: String) -> Double? { value(s) }
 
     static func formatCPU(_ millicores: Double) -> String {
         guard millicores > 0 else { return "—" }
+        if millicores < 1 { return String(format: "%.2fm", millicores) }
         if millicores < 1000 { return "\(Int(millicores.rounded()))m" }
         return trim(millicores / 1000)
     }
 
     static func formatMemory(_ bytes: Double) -> String {
         guard bytes > 0 else { return "—" }
+        if bytes < 1024 { return "\(Int(bytes.rounded()))" }
         let mi = bytes / 1048576
+        if mi < 0.5 { return "\(Int((bytes / 1024).rounded()))Ki" }
         if mi < 1024 { return "\(Int(mi.rounded()))Mi" }
         return trim(bytes / 1073741824) + "Gi"
     }
@@ -105,34 +127,36 @@ enum Quantity {
 
 enum Derive {
     static func pod(_ pod: K8sPod) -> ResourceRow {
-        let (text, kind) = PodStatusDerivation.derive(pod)
+        let age = Age.stamp(pod.metadata.creationTimestamp)
+        let summary = PodStatusDerivation.summarize(pod)
         let req = PodStatusDerivation.requestedResources(pod)
-        let restarts = PodStatusDerivation.restartCount(pod)
+        let restarts = summary.restarts
         return ResourceRow(
             kind: .pods,
             namespace: pod.metadata.namespace ?? "",
             name: pod.metadata.name,
-            statusText: text,
-            statusKind: kind,
+            statusText: summary.reason,
+            statusKind: summary.kind,
             cells: [
-                "ready": PodStatusDerivation.readyString(pod),
+                "ready": summary.readyText,
                 "restarts": "\(restarts)",
                 "cpu": req.cpu,
                 "mem": req.memory,
                 "nodeName": pod.spec?.nodeName ?? "",   // not a column; joined to node arch by the view model
                 "controlledBy": PodStatusDerivation.controllingWorkload(pod) ?? "",   // not a column; used by the delete confirm
-                "age": Age.format(pod.metadata.creationTimestamp), "created": Age.absolute(pod.metadata.creationTimestamp),
+                "age": age.text, "created": age.absolute,
             ],
             sortValues: [
-                "ready": Double(PodStatusDerivation.readyCount(pod)),
+                "ready": Double(summary.ready),
                 "restarts": Double(restarts),
                 "cpu": req.cpuMillis,
                 "mem": req.memBytes,
-                "age": Age.seconds(pod.metadata.creationTimestamp),
+                "age": age.seconds,
             ])
     }
 
     static func namespace(_ ns: K8sNamespace) -> ResourceRow {
+        let age = Age.stamp(ns.metadata.creationTimestamp)
         let phase = ns.status?.phase ?? "Active"
         return ResourceRow(
             kind: .namespaces,
@@ -140,32 +164,52 @@ enum Derive {
             name: ns.metadata.name,
             statusText: phase,
             statusKind: phase == "Active" ? .neutral : .terminating,
-            cells: ["age": Age.format(ns.metadata.creationTimestamp), "created": Age.absolute(ns.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(ns.metadata.creationTimestamp)])
+            cells: ["age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func node(_ node: K8sNode, usage: NodeUsage?) -> ResourceRow {
-        let ready = node.status?.conditions?.first { $0.type == "Ready" }?.status == "True"
+        let age = Age.stamp(node.metadata.creationTimestamp)
+        // kubectl `printNode`: Ready / NotReady / Unknown (no Ready condition at all —
+        // the node never reported), plus ",SchedulingDisabled" for a cordoned node.
+        let conds = node.status?.conditions ?? []
+        var text: String
+        var kind: StatusKind
+        switch conds.first(where: { $0.type == "Ready" })?.status {
+        case "True": (text, kind) = ("Ready", .healthy)
+        case nil, "Unknown": (text, kind) = ("Unknown", .unknown)
+        default: (text, kind) = ("NotReady", .error)
+        }
+        if node.spec?.unschedulable == true {
+            text += ",SchedulingDisabled"
+            if kind == .healthy { kind = .warning }
+        }
+        // Pressure doesn't change kubectl's text, but a viewer should flag it.
+        let pressure = conds.filter { ["MemoryPressure", "DiskPressure", "PIDPressure"].contains($0.type ?? "") && $0.status == "True" }
+        if kind == .healthy, !pressure.isEmpty {
+            kind = .warning
+            text += "," + pressure.compactMap(\.type).joined(separator: ",")
+        }
         return ResourceRow(
             kind: .nodes,
             namespace: "",
             name: node.metadata.name,
-            statusText: ready ? "Ready" : "NotReady",
-            statusKind: ready ? .healthy : .error,
+            statusText: text,
+            statusKind: kind,
             cells: [
                 "arch": node.status?.nodeInfo?.architecture ?? "—",
                 "cpu": usage?.cpuText ?? "—",
                 "cpupct": usage?.cpuPctText ?? "—",
                 "mem": usage?.memText ?? "—",
                 "mempct": usage?.memPctText ?? "—",
-                "age": Age.format(node.metadata.creationTimestamp), "created": Age.absolute(node.metadata.creationTimestamp),
+                "age": age.text, "created": age.absolute,
             ],
             sortValues: [
                 "cpu": usage?.cpuMillis ?? 0,
                 "cpupct": usage?.cpuPct ?? 0,
                 "mem": usage?.memBytes ?? 0,
                 "mempct": usage?.memPct ?? 0,
-                "age": Age.seconds(node.metadata.creationTimestamp),
+                "age": age.seconds,
             ])
     }
 
@@ -173,7 +217,23 @@ enum Derive {
         let type = e.type ?? "Normal"
         let objText = [e.involvedObject?.kind, e.involvedObject?.name]
             .compactMap { $0 }.joined(separator: "/")
-        let last = e.lastTimestamp ?? e.firstTimestamp ?? e.metadata.creationTimestamp
+        // kubectl `printEvent`: events written through events.k8s.io (the scheduler,
+        // kubelet, kcm) leave first/lastTimestamp + count empty and carry `eventTime` and
+        // `series` instead — without this a FailedScheduling repeating for an hour shows
+        // its first sighting, count 1, and sinks in a newest-first list.
+        let first = e.firstTimestamp ?? e.eventTime ?? e.metadata.creationTimestamp
+        let count = e.series?.count ?? max(1, e.count ?? 0)
+        let source: String = {
+            if let c = e.source?.component, !c.isEmpty {
+                return e.source?.host.map { "\(c), \($0)" } ?? c
+            }
+            if let c = e.reportingComponent, !c.isEmpty {
+                return e.reportingInstance.map { $0.isEmpty ? c : "\(c), \($0)" } ?? c
+            }
+            return "—"
+        }()
+        let firstDate = first.flatMap(Age.parse)
+        let lastDate = (e.series?.lastObservedTime ?? e.lastTimestamp).flatMap(Age.parse) ?? firstDate
         let message = (e.message ?? "").replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespaces)
         return ResourceRow(
@@ -185,32 +245,27 @@ enum Derive {
             cells: [
                 "reason": e.reason ?? "—",
                 "message": message.isEmpty ? "—" : message,
-                "count": "\(e.count ?? 1)",
+                "count": "\(count)",
                 "type": type,
                 "object": objText.isEmpty ? "—" : objText,
-                "source": e.source?.component ?? "—",
-                "first": Age.timestamp(e.firstTimestamp),
-                "age": Age.timestamp(last),
+                "source": source,
+                "first": firstDate.map { Age.timestamp($0) } ?? "—",
+                "age": lastDate.map { Age.timestamp($0) } ?? "—",
             ],
             sortValues: [
-                "count": Double(e.count ?? 1),
-                "age": Age.seconds(last),
+                "count": Double(count),
+                "age": lastDate.map { Age.seconds(since: $0) } ?? 0,
             ],
             uid: e.metadata.name)   // events' name is the reason → use the real name as identity
     }
 
     static func deployment(_ dep: K8sDeployment) -> ResourceRow {
+        let age = Age.stamp(dep.metadata.creationTimestamp)
         let desired = dep.spec?.replicas ?? 0
         let ready = dep.status?.readyReplicas ?? 0
         let updated = dep.status?.updatedReplicas ?? 0
         let available = dep.status?.availableReplicas ?? 0
-        var (text, kind) = replicaStatus(desired: desired, ready: ready, available: available)
-        if let conds = dep.status?.conditions,
-           let prog = conds.first(where: { $0.type == "Progressing" }),
-           prog.status == "False" {
-            kind = .error
-            text = prog.reason ?? "Failed"
-        }
+        let (text, kind) = deploymentStatus(dep, desired: desired, ready: ready, updated: updated, available: available)
         return ResourceRow(
             kind: .deployments,
             namespace: dep.metadata.namespace ?? "",
@@ -221,16 +276,17 @@ enum Derive {
                 "uptodate": "\(updated)",
                 "available": "\(available)",
                 "rollout": dep.spec?.strategy?.type ?? "RollingUpdate",   // not a column; drives the restart note
-                "age": Age.format(dep.metadata.creationTimestamp), "created": Age.absolute(dep.metadata.creationTimestamp),
+                "age": age.text, "created": age.absolute,
             ],
             sortValues: [
                 "ready": Double(ready), "uptodate": Double(updated), "available": Double(available),
                 "desired": Double(desired),   // current replica count, for the scale dialog
-                "age": Age.seconds(dep.metadata.creationTimestamp),
+                "age": age.seconds,
             ])
     }
 
     static func statefulSet(_ ss: K8sStatefulSet) -> ResourceRow {
+        let age = Age.stamp(ss.metadata.creationTimestamp)
         let desired = ss.spec?.replicas ?? 0
         let ready = ss.status?.readyReplicas ?? 0
         let updated = ss.status?.updatedReplicas ?? 0
@@ -244,16 +300,17 @@ enum Derive {
                 "ready": "\(ready)/\(desired)",
                 "uptodate": "\(updated)",
                 "rollout": ss.spec?.updateStrategy?.type ?? "RollingUpdate",   // not a column; drives the restart note
-                "age": Age.format(ss.metadata.creationTimestamp), "created": Age.absolute(ss.metadata.creationTimestamp),
+                "age": age.text, "created": age.absolute,
             ],
             sortValues: [
                 "ready": Double(ready), "uptodate": Double(updated),
                 "desired": Double(desired),   // current replica count, for the scale dialog
-                "age": Age.seconds(ss.metadata.creationTimestamp),
+                "age": age.seconds,
             ])
     }
 
     static func replicaSet(_ rs: K8sReplicaSet) -> ResourceRow {
+        let age = Age.stamp(rs.metadata.creationTimestamp)
         let desired = rs.spec?.replicas ?? 0
         let current = rs.status?.replicas ?? 0
         let ready = rs.status?.readyReplicas ?? 0
@@ -267,21 +324,26 @@ enum Derive {
                 "desired": "\(desired)",
                 "current": "\(current)",
                 "ready": "\(ready)",
-                "age": Age.format(rs.metadata.creationTimestamp), "created": Age.absolute(rs.metadata.creationTimestamp),
+                "age": age.text, "created": age.absolute,
             ],
             sortValues: [
                 "desired": Double(desired), "current": Double(current), "ready": Double(ready),
-                "age": Age.seconds(rs.metadata.creationTimestamp),
+                "age": age.seconds,
             ])
     }
 
     static func daemonSet(_ ds: K8sDaemonSet) -> ResourceRow {
+        let age = Age.stamp(ds.metadata.creationTimestamp)
         let desired = ds.status?.desiredNumberScheduled ?? 0
         let current = ds.status?.currentNumberScheduled ?? 0
         let ready = ds.status?.numberReady ?? 0
         let updated = ds.status?.updatedNumberScheduled ?? 0
         let available = ds.status?.numberAvailable ?? ready
-        let (text, kind) = replicaStatus(desired: desired, ready: ready, available: available)
+        // A DaemonSet isn't "scaled": zero desired means no node matches its
+        // selector/tolerations — worth a look, not a calm "Scaled to 0".
+        let (text, kind) = desired == 0
+            ? ("No nodes match", .warning)
+            : replicaStatus(desired: desired, ready: ready, available: available)
         return ResourceRow(
             kind: .daemonSets,
             namespace: ds.metadata.namespace ?? "",
@@ -294,34 +356,27 @@ enum Derive {
                 "uptodate": "\(updated)",
                 "available": "\(available)",
                 "rollout": ds.spec?.updateStrategy?.type ?? "RollingUpdate",   // not a column; drives the restart note
-                "age": Age.format(ds.metadata.creationTimestamp), "created": Age.absolute(ds.metadata.creationTimestamp),
+                "age": age.text, "created": age.absolute,
             ],
             sortValues: [
                 "desired": Double(desired), "current": Double(current), "ready": Double(ready),
                 "uptodate": Double(updated), "available": Double(available),
-                "age": Age.seconds(ds.metadata.creationTimestamp),
+                "age": age.seconds,
             ])
     }
 
     static func configMap(_ cm: K8sConfigMap) -> ResourceRow {
+        let age = Age.stamp(cm.metadata.creationTimestamp)
         let keys = (cm.data?.count ?? 0) + (cm.binaryData?.count ?? 0)
         return ResourceRow(
             kind: .configMaps, namespace: cm.metadata.namespace ?? "", name: cm.metadata.name,
             statusText: "", statusKind: .neutral,
-            cells: ["keys": "\(keys)", "age": Age.format(cm.metadata.creationTimestamp), "created": Age.absolute(cm.metadata.creationTimestamp)],
-            sortValues: ["keys": Double(keys), "age": Age.seconds(cm.metadata.creationTimestamp)])
-    }
-
-    static func secret(_ s: K8sSecret) -> ResourceRow {
-        let keys = s.data?.count ?? 0
-        return ResourceRow(
-            kind: .secrets, namespace: s.metadata.namespace ?? "", name: s.metadata.name,
-            statusText: "", statusKind: .neutral,
-            cells: ["type": s.type ?? "Opaque", "keys": "\(keys)", "age": Age.format(s.metadata.creationTimestamp), "created": Age.absolute(s.metadata.creationTimestamp)],
-            sortValues: ["keys": Double(keys), "age": Age.seconds(s.metadata.creationTimestamp)])
+            cells: ["keys": "\(keys)", "age": age.text, "created": age.absolute],
+            sortValues: ["keys": Double(keys), "age": age.seconds])
     }
 
     static func service(_ svc: K8sService) -> ResourceRow {
+        let age = Age.stamp(svc.metadata.creationTimestamp)
         let ip = svc.spec?.clusterIP ?? "—"
         let ports = (svc.spec?.ports ?? []).map {
             ($0.port.map(String.init) ?? "?") + ($0.proto.map { "/\($0)" } ?? "")
@@ -330,53 +385,62 @@ enum Derive {
             kind: .services, namespace: svc.metadata.namespace ?? "", name: svc.metadata.name,
             statusText: "", statusKind: .neutral,
             cells: ["type": svc.spec?.type ?? "ClusterIP", "clusterIP": ip,
-                    "ports": ports.isEmpty ? "—" : ports, "age": Age.format(svc.metadata.creationTimestamp), "created": Age.absolute(svc.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(svc.metadata.creationTimestamp)])
+                    "ports": ports.isEmpty ? "—" : ports, "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func ingress(_ ing: K8sIngress) -> ResourceRow {
-        let hosts = (ing.spec?.rules ?? []).compactMap { $0.host }.joined(separator: ", ")
-        let entry = ing.status?.loadBalancer?.ingress?.first
-        let address = entry?.ip ?? entry?.hostname ?? "—"
+        let age = Age.stamp(ing.metadata.creationTimestamp)
+        // kubectl prints a rule without a host as "*" (it matches every host).
+        let hosts = (ing.spec?.rules ?? []).map { ($0.host ?? "").isEmpty ? "*" : $0.host! }.joined(separator: ", ")
+        let addresses = (ing.status?.loadBalancer?.ingress ?? []).compactMap { $0.ip ?? $0.hostname }
+        let address = addresses.isEmpty ? "—" : addresses.joined(separator: ",")
         return ResourceRow(
             kind: .ingresses, namespace: ing.metadata.namespace ?? "", name: ing.metadata.name,
             statusText: "", statusKind: .neutral,
             cells: ["hosts": hosts.isEmpty ? "—" : hosts, "address": address,
-                    "age": Age.format(ing.metadata.creationTimestamp), "created": Age.absolute(ing.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(ing.metadata.creationTimestamp)])
+                    "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func pvc(_ p: K8sPVC) -> ResourceRow {
-        let phase = p.status?.phase ?? "Unknown"
-        let kind: StatusKind
+        let age = Age.stamp(p.metadata.creationTimestamp)
+        var phase = p.status?.phase ?? "Unknown"
+        var kind: StatusKind
         switch phase {
         case "Bound": kind = .healthy
         case "Pending": kind = .pending
         case "Lost": kind = .error
         default: kind = .unknown
         }
+        // A claim held by the `pvc-protection` finalizer (a pod still mounts it) sits
+        // here for as long as that pod lives — kubectl shows it as Terminating.
+        if p.metadata.deletionTimestamp != nil { (phase, kind) = ("Terminating", .terminating) }
         let capacity = p.status?.capacity?.storage ?? p.spec?.resources?.requests?.storage ?? "—"
         return ResourceRow(
             kind: .persistentVolumeClaims, namespace: p.metadata.namespace ?? "", name: p.metadata.name,
             statusText: phase, statusKind: kind,
             cells: ["capacity": capacity, "storageClass": p.spec?.storageClassName ?? "—",
-                    "age": Age.format(p.metadata.creationTimestamp), "created": Age.absolute(p.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(p.metadata.creationTimestamp)])
+                    "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func networkPolicy(_ np: K8sNetworkPolicy) -> ResourceRow {
-        let sel = np.spec?.podSelector?.matchLabels ?? [:]
-        let selText = sel.isEmpty ? "all pods" : sel.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ")
+        let age = Age.stamp(np.metadata.creationTimestamp)
+        // Only a truly empty selector means every pod — `matchExpressions` alone used to
+        // render as "all pods", making a narrow policy look namespace-wide.
+        let selText = (np.spec?.podSelector).map { $0.isEmpty ? "all pods" : $0.formatted } ?? "all pods"
         let types = (np.spec?.policyTypes ?? []).joined(separator: ", ")
         return ResourceRow(
             kind: .networkPolicies, namespace: np.metadata.namespace ?? "", name: np.metadata.name,
             statusText: "", statusKind: .neutral,
             cells: ["podSelector": selText, "policyTypes": types.isEmpty ? "—" : types,
-                    "age": Age.format(np.metadata.creationTimestamp), "created": Age.absolute(np.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(np.metadata.creationTimestamp)])
+                    "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func endpoints(_ ep: K8sEndpoints) -> ResourceRow {
+        let age = Age.stamp(ep.metadata.creationTimestamp)
         var pairs: [String] = []
         var count = 0
         for subset in ep.subsets ?? [] {
@@ -393,13 +457,14 @@ enum Derive {
         return ResourceRow(
             kind: .endpoints, namespace: ep.metadata.namespace ?? "", name: ep.metadata.name,
             statusText: "", statusKind: count == 0 ? .warning : .neutral,   // no endpoints = a red flag
-            cells: ["endpoints": summary, "count": "\(count)", "age": Age.format(ep.metadata.creationTimestamp), "created": Age.absolute(ep.metadata.creationTimestamp)],
-            sortValues: ["count": Double(count), "age": Age.seconds(ep.metadata.creationTimestamp)])
+            cells: ["endpoints": summary, "count": "\(count)", "age": age.text, "created": age.absolute],
+            sortValues: ["count": Double(count), "age": age.seconds])
     }
 
     static func pv(_ pv: K8sPV) -> ResourceRow {
-        let phase = pv.status?.phase ?? "Unknown"
-        let kind: StatusKind
+        let age = Age.stamp(pv.metadata.creationTimestamp)
+        var phase = pv.status?.phase ?? "Unknown"
+        var kind: StatusKind
         switch phase {
         case "Bound", "Available": kind = .healthy
         case "Released": kind = .warning
@@ -407,6 +472,7 @@ enum Derive {
         case "Pending": kind = .pending
         default: kind = .unknown
         }
+        if pv.metadata.deletionTimestamp != nil { (phase, kind) = ("Terminating", .terminating) }
         let ref = pv.spec?.claimRef
         let claim = ref.flatMap { r -> String? in
             guard let n = r.name else { return nil }
@@ -419,8 +485,8 @@ enum Derive {
                     "accessModes": (pv.spec?.accessModes ?? []).map(shortAccessMode).joined(separator: ","),
                     "reclaim": pv.spec?.persistentVolumeReclaimPolicy ?? "—",
                     "storageClass": pv.spec?.storageClassName ?? "—",
-                    "claim": claim, "age": Age.format(pv.metadata.creationTimestamp), "created": Age.absolute(pv.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(pv.metadata.creationTimestamp)])
+                    "claim": claim, "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     private static func shortAccessMode(_ m: String) -> String {
@@ -434,7 +500,10 @@ enum Derive {
     }
 
     static func storageClass(_ sc: K8sStorageClass) -> ResourceRow {
-        let isDefault = sc.metadata.annotations?["storageclass.kubernetes.io/is-default-class"] == "true"
+        let age = Age.stamp(sc.metadata.creationTimestamp)
+        let ann = sc.metadata.annotations ?? [:]
+        let isDefault = ann["storageclass.kubernetes.io/is-default-class"] == "true"
+            || ann["storageclass.beta.kubernetes.io/is-default-class"] == "true"   // legacy, still honored
         return ResourceRow(
             kind: .storageClasses, namespace: "", name: sc.metadata.name,
             statusText: "", statusKind: .neutral,
@@ -442,11 +511,12 @@ enum Derive {
                     "reclaim": sc.reclaimPolicy ?? "Delete",
                     "binding": sc.volumeBindingMode ?? "Immediate",
                     "default": isDefault ? "✓" : "",
-                    "age": Age.format(sc.metadata.creationTimestamp), "created": Age.absolute(sc.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(sc.metadata.creationTimestamp)])
+                    "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func pdb(_ pdb: K8sPDB) -> ResourceRow {
+        let age = Age.stamp(pdb.metadata.creationTimestamp)
         let current = pdb.status?.currentHealthy ?? 0
         let desired = pdb.status?.desiredHealthy ?? 0
         let allowed = pdb.status?.disruptionsAllowed ?? 0
@@ -456,71 +526,114 @@ enum Derive {
             statusText: ok ? "Healthy" : "Degraded", statusKind: ok ? .healthy : .warning,
             cells: ["minAvailable": pdb.spec?.minAvailable?.text ?? "—",
                     "maxUnavailable": pdb.spec?.maxUnavailable?.text ?? "—",
-                    "allowed": "\(allowed)", "age": Age.format(pdb.metadata.creationTimestamp), "created": Age.absolute(pdb.metadata.creationTimestamp)],
-            sortValues: ["allowed": Double(allowed), "age": Age.seconds(pdb.metadata.creationTimestamp)])
+                    "allowed": "\(allowed)", "age": age.text, "created": age.absolute],
+            sortValues: ["allowed": Double(allowed), "age": age.seconds])
     }
 
     static func job(_ j: K8sJob) -> ResourceRow {
+        let age = Age.stamp(j.metadata.creationTimestamp)
         let succeeded = j.status?.succeeded ?? 0
-        let completions = j.spec?.completions ?? 1
-        let active = j.status?.active ?? 0
         let failed = j.status?.failed ?? 0
         var kind: StatusKind = .pending
         var text = "Running"
         let conds = j.status?.conditions ?? []
-        if conds.contains(where: { $0.type == "Complete" && $0.status == "True" }) {
+        func isTrue(_ type: String) -> Bool { conds.contains { $0.type == type && $0.status == "True" } }
+        // Between retries `active` is 0 while failures accumulate; until the controller
+        // writes a Failed condition the Job is still trying — kubectl says Running.
+        if isTrue("Complete") {
             kind = .healthy; text = "Complete"
-        } else if conds.contains(where: { $0.type == "Failed" && $0.status == "True" }) {
+        } else if isTrue("Failed") {
             kind = .error; text = "Failed"
-        } else if active > 0 {
-            kind = .pending; text = "Running"
+        } else if j.spec?.suspend == true || isTrue("Suspended") {
+            kind = .warning; text = "Suspended"
         } else if failed > 0 {
-            kind = .warning; text = "Failed:\(failed)"
+            kind = .warning; text = "Running (\(failed) failed)"
+        }
+        if j.metadata.deletionTimestamp != nil { (text, kind) = ("Terminating", .terminating) }
+        // kubectl's COMPLETIONS: "N/M"; a work-queue Job (no completions, parallelism > 1)
+        // is "N/1 of P".
+        let completionsText: String
+        if let completions = j.spec?.completions {
+            completionsText = "\(succeeded)/\(completions)"
+        } else if let p = j.spec?.parallelism, p > 1 {
+            completionsText = "\(succeeded)/1 of \(p)"
+        } else {
+            completionsText = "\(succeeded)/1"
         }
         let duration = jobDuration(j.status?.startTime, j.status?.completionTime)
         return ResourceRow(
             kind: .jobs, namespace: j.metadata.namespace ?? "", name: j.metadata.name,
             statusText: text, statusKind: kind,
-            cells: ["completions": "\(succeeded)/\(completions)", "duration": duration,
-                    "age": Age.format(j.metadata.creationTimestamp), "created": Age.absolute(j.metadata.creationTimestamp)],
-            sortValues: ["completions": Double(succeeded), "age": Age.seconds(j.metadata.creationTimestamp)])
+            cells: ["completions": completionsText, "duration": duration,
+                    "age": age.text, "created": age.absolute],
+            sortValues: ["completions": Double(succeeded), "age": age.seconds])
     }
 
     static func cronJob(_ c: K8sCronJob) -> ResourceRow {
+        let age = Age.stamp(c.metadata.creationTimestamp)
         let suspended = c.spec?.suspend ?? false
-        let lastRun = c.status?.lastScheduleTime.map { Age.format($0) } ?? "—"
+        let lastRun = Age.format(c.status?.lastScheduleTime)
         return ResourceRow(
             kind: .cronJobs, namespace: c.metadata.namespace ?? "", name: c.metadata.name,
             statusText: "", statusKind: suspended ? .warning : .neutral,
             cells: ["schedule": c.spec?.schedule ?? "—", "suspend": suspended ? "Yes" : "No",
-                    "lastRun": lastRun, "age": Age.format(c.metadata.creationTimestamp), "created": Age.absolute(c.metadata.creationTimestamp)],
-            sortValues: ["age": Age.seconds(c.metadata.creationTimestamp)])
+                    "lastRun": lastRun, "age": age.text, "created": age.absolute],
+            sortValues: ["age": age.seconds])
     }
 
     static func serviceAccount(_ sa: K8sServiceAccount) -> ResourceRow {
+        let age = Age.stamp(sa.metadata.creationTimestamp)
         let n = sa.secrets?.count ?? 0
         return ResourceRow(
             kind: .serviceAccounts, namespace: sa.metadata.namespace ?? "", name: sa.metadata.name,
             statusText: "", statusKind: .neutral,
-            cells: ["secrets": "\(n)", "age": Age.format(sa.metadata.creationTimestamp), "created": Age.absolute(sa.metadata.creationTimestamp)],
-            sortValues: ["secrets": Double(n), "age": Age.seconds(sa.metadata.creationTimestamp)])
+            cells: ["secrets": "\(n)", "age": age.text, "created": age.absolute],
+            sortValues: ["secrets": Double(n), "age": age.seconds])
     }
 
     static func hpa(_ h: K8sHPA) -> ResourceRow {
+        let age = Age.stamp(h.metadata.creationTimestamp)
         let current = h.status?.currentReplicas ?? 0
         let desired = h.status?.desiredReplicas ?? current
+        // An HPA that can't read its metrics (no metrics-server, wrong target) silently
+        // stops scaling; its conditions are the only place that shows.
+        let conds = h.status?.conditions ?? []
+        let stuck = conds.first { ($0.type == "AbleToScale" || $0.type == "ScalingActive") && $0.status == "False" }
+        let (text, kind): (String, StatusKind) = stuck.map { ($0.reason ?? "Inactive", .warning) }
+            ?? (conds.isEmpty ? ("", .neutral) : ("Active", .healthy))
         return ResourceRow(
             kind: .horizontalPodAutoscalers, namespace: h.metadata.namespace ?? "", name: h.metadata.name,
-            statusText: "", statusKind: .neutral,
+            statusText: text, statusKind: kind,
             cells: ["min": "\(h.spec?.minReplicas ?? 0)", "max": "\(h.spec?.maxReplicas ?? 0)",
-                    "replicas": "\(current)/\(desired)", "age": Age.format(h.metadata.creationTimestamp), "created": Age.absolute(h.metadata.creationTimestamp)],
-            sortValues: ["replicas": Double(current), "age": Age.seconds(h.metadata.creationTimestamp)])
+                    "replicas": "\(current)/\(desired)", "age": age.text, "created": age.absolute],
+            sortValues: ["replicas": Double(current), "age": age.seconds])
     }
 
     private static func jobDuration(_ start: String?, _ end: String?) -> String {
         guard let start, let startDate = Age.parse(start) else { return "—" }
         let endDate = end.flatMap(Age.parse) ?? Date()
         return Age.humanize(max(0, endDate.timeIntervalSince(startDate)))
+    }
+
+    /// A Deployment's verdict from its conditions (what the controller itself
+    /// concluded), falling back to replica arithmetic only when they say nothing:
+    /// `ReplicaFailure` (quota / admission) and a blown progress deadline are errors;
+    /// an in-flight rollout is Progressing — even when `ready ≥ desired` during a
+    /// surge, and even when `ready == 0` seconds after creation.
+    private static func deploymentStatus(_ dep: K8sDeployment, desired: Int, ready: Int,
+                                         updated: Int, available: Int) -> (String, StatusKind) {
+        let conds = dep.status?.conditions ?? []
+        func cond(_ type: String) -> DeploymentCondition? { conds.first { $0.type == type } }
+        if let rf = cond("ReplicaFailure"), rf.status == "True" { return (rf.reason ?? "ReplicaFailure", .error) }
+        if let prog = cond("Progressing"), prog.status == "False" { return (prog.reason ?? "ProgressDeadlineExceeded", .error) }
+        if desired == 0 { return ("Scaled to 0", .completed) }
+        let rolling = cond("Progressing").map { $0.status == "True" && $0.reason != "NewReplicaSetAvailable" } ?? false
+        if rolling || updated < desired { return ("Progressing", .pending) }
+        if let av = cond("Available") {
+            if av.status == "True" { return ready >= desired ? ("Available", .healthy) : ("Degraded", .warning) }
+            return ready == 0 ? ("Unavailable", .error) : ("Degraded", .warning)
+        }
+        return replicaStatus(desired: desired, ready: ready, available: available)
     }
 
     /// Shared readiness verdict for the controller kinds.
@@ -534,65 +647,122 @@ enum Derive {
 
 // MARK: - Pod status derivation
 
-/// Replicates kubectl's `printPod` STATUS-column logic closely enough for a viewer.
+/// Replicates kubectl's `printPod` (STATUS / READY / RESTARTS columns), including
+/// native sidecars (init containers with `restartPolicy: Always`, GA in 1.33).
 enum PodStatusDerivation {
-    static func derive(_ pod: K8sPod) -> (String, StatusKind) {
+    /// STATUS text + health, READY counts and RESTARTS — one pass, as kubectl does it.
+    struct Summary {
+        var reason: String
+        var kind: StatusKind
+        var ready: Int
+        var total: Int
+        var restarts: Int
+        var readyText: String { "\(ready)/\(total)" }
+    }
+
+    /// An init container that keeps running beside the app (a native sidecar).
+    static func isRestartable(_ c: NamedContainer?) -> Bool { c?.restartPolicy == "Always" }
+
+    private static func condition(_ pod: K8sPod, _ type: String) -> PodCondition? {
+        pod.status?.conditions?.first { $0.type == type }
+    }
+
+    static func summarize(_ pod: K8sPod) -> Summary {
         let status = pod.status
-        var reason = status?.phase ?? "Unknown"
+        let phase = status?.phase ?? "Unknown"
+        var reason = phase
         if let r = status?.reason, !r.isEmpty { reason = r }
+        // Scheduling gates hold a pod before the scheduler even looks at it.
+        if (status?.conditions ?? []).contains(where: { $0.type == "PodScheduled" && $0.reason == "SchedulingGated" }) {
+            reason = "SchedulingGated"
+        }
+
+        let initSpecs = Dictionary((pod.spec?.initContainers ?? []).map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+        var total = (pod.spec?.containers ?? []).count
+            + (pod.spec?.initContainers ?? []).filter(isRestartable).count
+        var ready = 0
+        var restarts = 0
+        var sidecarRestarts = 0
 
         var initializing = false
         let initStatuses = status?.initContainerStatuses ?? []
+        let initCount = pod.spec?.initContainers?.count ?? initStatuses.count
         for (i, ics) in initStatuses.enumerated() {
-            if let term = ics.state?.terminated {
-                if (term.exitCode ?? 0) == 0 && (term.signal ?? 0) == 0 { continue }
-                if let sig = term.signal, sig != 0 {
-                    reason = "Init:Signal:\(sig)"
-                } else if let r = term.reason, !r.isEmpty {
-                    reason = "Init:\(r)"
-                } else if let code = term.exitCode {
-                    reason = "Init:ExitCode:\(code)"
-                }
-                initializing = true
-            } else if let wait = ics.state?.waiting,
-                      let r = wait.reason, !r.isEmpty, r != "PodInitializing" {
-                reason = "Init:\(r)"
-                initializing = true
-            } else {
-                reason = "Init:\(i)/\(initStatuses.count)"
-                initializing = true
+            restarts += ics.restartCount ?? 0
+            let restartable = isRestartable(initSpecs[ics.name])
+            if restartable { sidecarRestarts += ics.restartCount ?? 0 }
+            if let term = ics.state?.terminated, (term.exitCode ?? 0) == 0 { continue }
+            if restartable, ics.started == true {
+                if ics.ready == true { ready += 1 }
+                continue
             }
+            if let term = ics.state?.terminated {
+                if let r = term.reason, !r.isEmpty {
+                    reason = "Init:\(r)"
+                } else if let sig = term.signal, sig != 0 {
+                    reason = "Init:Signal:\(sig)"
+                } else {
+                    reason = "Init:ExitCode:\(term.exitCode ?? 0)"
+                }
+            } else if let r = ics.state?.waiting?.reason, !r.isEmpty, r != "PodInitializing" {
+                reason = "Init:\(r)"
+            } else {
+                reason = "Init:\(i)/\(initCount)"
+            }
+            initializing = true
             break
         }
 
-        if !initializing {
-            let cstatuses = status?.containerStatuses ?? []
-            for cs in cstatuses.reversed() {
-                if let wait = cs.state?.waiting, let r = wait.reason, !r.isEmpty {
+        // Main containers are judged once init is done — or once the kubelet says the
+        // pod is Initialized (a crash-looping sidecar mustn't hide the app's state).
+        if !initializing || condition(pod, "Initialized")?.status == "True" {
+            restarts = sidecarRestarts
+            var hasRunning = false
+            for cs in (status?.containerStatuses ?? []).reversed() {
+                restarts += cs.restartCount ?? 0
+                if let r = cs.state?.waiting?.reason, !r.isEmpty {
                     reason = r
                 } else if let term = cs.state?.terminated {
                     if let r = term.reason, !r.isEmpty {
                         reason = r
                     } else if let sig = term.signal, sig != 0 {
                         reason = "Signal:\(sig)"
-                    } else if let code = term.exitCode {
-                        reason = "ExitCode:\(code)"
+                    } else {
+                        reason = "ExitCode:\(term.exitCode ?? 0)"
                     }
+                } else if cs.ready == true, cs.state?.running != nil {
+                    hasRunning = true
+                    ready += 1
                 }
+            }
+            // One container finished (a helper, or a Job's main container next to a
+            // mesh proxy) while another still runs: not "Completed".
+            if reason == "Completed" && hasRunning {
+                reason = condition(pod, "Ready")?.status == "True" ? "Running" : "NotReady"
             }
         }
 
         if pod.metadata.deletionTimestamp != nil {
-            reason = (status?.reason == "NodeLost") ? "Unknown" : "Terminating"
+            if status?.reason == "NodeLost" {
+                reason = "Unknown"
+            } else if phase != "Succeeded" && phase != "Failed" {
+                reason = "Terminating"   // a finished pod being deleted keeps Completed/Error
+            }
         }
+        if total == 0 { total = (status?.containerStatuses ?? []).count }
 
-        return (reason, kind(for: reason, allReady: isAllReady(pod)))
+        // Healthy needs the pod's Ready condition, not just ready containers: readiness
+        // gates (e.g. an AWS LB target registration) keep traffic off until they pass.
+        let podReady = condition(pod, "Ready").map { $0.status == "True" } ?? (ready == total && total > 0)
+        let kind = kind(for: reason, allReady: ready == total && total > 0 && podReady)
+        return Summary(reason: reason, kind: kind, ready: ready, total: total, restarts: restarts)
     }
 
     static func kind(for reason: String, allReady: Bool) -> StatusKind {
         if reason == "Running" { return allReady ? .healthy : .warning }
         if reason == "Completed" || reason == "Succeeded" { return .completed }
         if reason == "Terminating" { return .terminating }
+        if reason == "NotReady" { return .warning }
 
         let r = reason.lowercased()
         let errorMarkers = ["err", "backoff", "crashloop", "failed", "evicted",
@@ -600,38 +770,13 @@ enum PodStatusDerivation {
                             "unknown", "deadlineexceeded"]
         if errorMarkers.contains(where: { r.contains($0) }) { return .error }
 
-        if reason == "Pending" || reason == "ContainerCreating"
+        if reason == "Pending" || reason == "ContainerCreating" || reason == "SchedulingGated"
             || reason == "PodInitializing" || r.hasPrefix("init:") {
             return .pending
         }
         return .warning
     }
 
-    static func isAllReady(_ pod: K8sPod) -> Bool {
-        let cs = pod.status?.containerStatuses ?? []
-        guard !cs.isEmpty else { return false }
-        return cs.allSatisfy { $0.ready ?? false }
-    }
-
-    static func readyCount(_ pod: K8sPod) -> Int {
-        (pod.status?.containerStatuses ?? []).filter { $0.ready ?? false }.count
-    }
-
-    static func readyString(_ pod: K8sPod) -> String {
-        let cs = pod.status?.containerStatuses ?? []
-        let total = cs.isEmpty ? (pod.spec?.containers?.count ?? 0) : cs.count
-        let ready = cs.filter { $0.ready ?? false }.count
-        return "\(ready)/\(total)"
-    }
-
-    static func restartCount(_ pod: K8sPod) -> Int {
-        let cs = pod.status?.containerStatuses ?? []
-        return cs.reduce(0) { $0 + ($1.restartCount ?? 0) }
-    }
-
-    /// Plain-language "why is this pod (un)healthy" report plus restart/OOM
-    /// forensics. Formatted as `Key: value` / header lines so DescribeFormatter
-    /// colors it. Reads only status reasons/messages — never env vars or secrets.
     /// The workload that owns this pod, as "Kind/name" (for a clickable owner link).
     /// A pod's direct owner is a ReplicaSet, so resolve it to the parent Deployment
     /// by stripping the pod-template-hash suffix (RS name = <deployment>-<hash>).
@@ -646,20 +791,28 @@ enum PodStatusDerivation {
         return "\(kind)/\(name)"
     }
 
+    /// Plain-language "why is this pod (un)healthy" report plus restart/OOM
+    /// forensics. Formatted as `Key: value` / header lines so DescribeFormatter
+    /// colors it. Reads only status reasons/messages — never env vars or secrets.
     static func healthReport(_ pod: K8sPod) -> String {
-        let (reason, kind) = derive(pod)
+        let summary = summarize(pod)
+        let (reason, kind) = (summary.reason, summary.kind)
         let status = pod.status
         var notes: [String] = []
 
         if let bad = (status?.conditions ?? []).first(where: { $0.status == "False" && ($0.message?.isEmpty == false) }),
-           (status?.containerStatuses ?? []).isEmpty || reason == "Pending" {
+           (status?.containerStatuses ?? []).isEmpty || reason == "Pending" || reason == "SchedulingGated" {
             notes.append("Not scheduled/ready: \(bad.message ?? bad.reason ?? "—")")
         }
+        let initSpecs = Dictionary((pod.spec?.initContainers ?? []).map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
         for cs in status?.initContainerStatuses ?? [] {
+            let label = isRestartable(initSpecs[cs.name]) ? "Sidecar" : "Init container"
             if let w = cs.state?.waiting, let r = w.reason, !r.isEmpty, r != "PodInitializing" {
-                notes.append("Init container “\(cs.name)”: \(explain(r)).")
+                notes.append("\(label) “\(cs.name)”: \(explain(r)).")
             } else if let t = cs.state?.terminated, (t.exitCode ?? 0) != 0 {
-                notes.append("Init container “\(cs.name)” failed: \(terminationCause(t)).")
+                notes.append("\(label) “\(cs.name)” failed: \(terminationCause(t)).")
+            } else if isRestartable(initSpecs[cs.name]), let note = notReadyNote(cs, label: label) {
+                notes.append(note)
             }
         }
         for cs in status?.containerStatuses ?? [] {
@@ -668,12 +821,21 @@ enum PodStatusDerivation {
             } else if let t = cs.state?.terminated, t.reason != "Completed",
                       (t.exitCode ?? 0) != 0 || (t.signal ?? 0) != 0 {
                 notes.append("Container “\(cs.name)”: \(terminationCause(t)).")
+            } else if let note = notReadyNote(cs, label: "Container") {
+                notes.append(note)
             }
             if let lt = cs.lastState?.terminated, (lt.exitCode ?? 0) != 0 || lt.reason == "OOMKilled" {
                 let ago = Age.format(lt.finishedAt)
                 let when = ago == "—" ? "" : ", \(ago) ago"
                 notes.append("Container “\(cs.name)” previously \(terminationCause(lt))\(when) — restarted \(cs.restartCount ?? 0)×.")
             }
+        }
+        // Containers all ready but the pod isn't: a readiness gate (or a condition the
+        // kubelet hasn't caught up on) — its message names what's missing.
+        if reason == "Running" || reason == "NotReady",
+           let rc = condition(pod, "Ready"), rc.status == "False",
+           let msg = rc.message, !msg.isEmpty {
+            notes.append("Pod not ready: \(msg)")
         }
         if notes.isEmpty {
             notes.append(kind == .healthy
@@ -686,7 +848,7 @@ enum PodStatusDerivation {
         }
         var lines = [row("Namespace", pod.metadata.namespace ?? "—")]
         if let workload = controllingWorkload(pod) { lines.append(row("Controlled By", workload)) }
-        lines += [row("Status", reason), row("Ready", readyString(pod)), row("Restarts", "\(restartCount(pod))"),
+        lines += [row("Status", reason), row("Ready", summary.readyText), row("Restarts", "\(summary.restarts)"),
                   "", "Diagnosis:", notes.joined(separator: "\n")]
         var out = lines.joined(separator: "\n")
         let containers = status?.containerStatuses ?? []
@@ -848,6 +1010,16 @@ enum PodStatusDerivation {
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 
+    /// The most common "Running 0/1": the process is up, but a probe holds it out of
+    /// rotation. nil when the container is ready (or not running at all).
+    private static func notReadyNote(_ cs: ContainerStatus, label: String) -> String? {
+        guard cs.state?.running != nil, cs.ready == false else { return nil }
+        if cs.started == false {
+            return "\(label) “\(cs.name)” is running, but its startup probe hasn’t passed yet."
+        }
+        return "\(label) “\(cs.name)” is running but not ready — its readiness probe is failing (see Events)."
+    }
+
     /// Map a waiting/terminated reason to a developer-readable sentence fragment.
     private static func explain(_ reason: String) -> String {
         switch reason {
@@ -896,19 +1068,34 @@ enum PodStatusDerivation {
         return s
     }
 
+    /// The pod's effective request — what the scheduler reserves — not just the sum of
+    /// `containers`: init containers run one at a time before them, so the pod needs
+    /// `max(sum(app containers + sidecars), max over each plain init container +
+    /// the sidecars started before it)`. A heavy migration init container would
+    /// otherwise vanish from the column.
     static func requestedResources(_ pod: K8sPod) -> (cpu: String, memory: String, cpuMillis: Double, memBytes: Double) {
-        var cpuMillis = 0.0, memBytes = 0.0
         var hasCPU = false, hasMem = false
-        for container in pod.spec?.containers ?? [] {
-            if let cpu = container.resources?.requests?.cpu,
-               let m = Quantity.cpuMillicores(cpu) {
-                cpuMillis += m; hasCPU = true
-            }
-            if let mem = container.resources?.requests?.memory,
-               let b = Quantity.memoryBytes(mem) {
-                memBytes += b; hasMem = true
+        func req(_ c: NamedContainer) -> (cpu: Double, mem: Double) {
+            var cpu = 0.0, mem = 0.0
+            if let s = c.resources?.requests?.cpu, let m = Quantity.cpuMillicores(s) { cpu = m; hasCPU = true }
+            if let s = c.resources?.requests?.memory, let b = Quantity.memoryBytes(s) { mem = b; hasMem = true }
+            return (cpu, mem)
+        }
+        var cpuMillis = 0.0, memBytes = 0.0
+        for c in pod.spec?.containers ?? [] {
+            let r = req(c); cpuMillis += r.cpu; memBytes += r.mem
+        }
+        var sidecarCPU = 0.0, sidecarMem = 0.0, initCPU = 0.0, initMem = 0.0
+        for c in pod.spec?.initContainers ?? [] {
+            let r = req(c)
+            if isRestartable(c) {
+                sidecarCPU += r.cpu; sidecarMem += r.mem   // runs for the pod's whole life
+            } else {
+                initCPU = max(initCPU, sidecarCPU + r.cpu); initMem = max(initMem, sidecarMem + r.mem)
             }
         }
+        cpuMillis = max(cpuMillis + sidecarCPU, initCPU)
+        memBytes = max(memBytes + sidecarMem, initMem)
         return (hasCPU ? Quantity.formatCPU(cpuMillis) : "—",
                 hasMem ? Quantity.formatMemory(memBytes) : "—",
                 cpuMillis, memBytes)
@@ -927,11 +1114,13 @@ struct NamespaceResource: Sendable {
 }
 
 /// The kinds queried for a namespace's full entity list, and the map from the
-/// JSON `kind` back to our ResourceKind (for double-click navigation).
+/// JSON `kind` back to our ResourceKind (for double-click navigation). Secrets are
+/// NOT in the JSON query — that would pull every value into this process; they're
+/// listed separately through the server-side Table (see `KubectlClient.secretRows`).
 enum NamespaceInventory {
     static let queryKinds: [ResourceKind] = [
         .pods, .deployments, .statefulSets, .daemonSets, .replicaSets, .services,
-        .ingresses, .configMaps, .secrets, .serviceAccounts, .persistentVolumeClaims,
+        .ingresses, .configMaps, .serviceAccounts, .persistentVolumeClaims,
         .jobs, .cronJobs, .horizontalPodAutoscalers,
     ]
 

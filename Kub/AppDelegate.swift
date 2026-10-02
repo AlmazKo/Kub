@@ -122,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         wrapItem.target = self
         wrapItem.state = Settings.wrapDetailText ? .on : .off
         viewMenu.addItem(.separator())
-        viewMenu.addItem(withTitle: "Customize Context…",
+        viewMenu.addItem(withTitle: "Customize Current Context…",
                          action: Selector(("customizeContext:")), keyEquivalent: "")
 
         // Window menu

@@ -1,7 +1,8 @@
 import AppKit
 
-/// Bottom detail pane: title + Overview/Logs/Events selector + a read-only
-/// monospaced text view fed by kubectl describe/logs/get-events.
+/// Bottom detail pane: kind icon + title, a per-kind `DetailSection` switcher, a
+/// shared filter field, and one content view at a time (describe text, Top, node
+/// pods, namespace inventory, Events, live logs, metrics, shell).
 final class DetailPaneView: NSView {
     private let titleIcon = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
@@ -10,7 +11,8 @@ final class DetailPaneView: NSView {
     private let refreshButton = NSButton()
     // Built on an explicit TextKit 1 stack: on macOS 26 a default NSTextView is
     // TextKit 2, whose wrapping ignores the classic container config — so no-wrap
-    // "stuck" on. A hand-built TextKit 1 view with a huge container never wraps.
+    // "stuck" on. A hand-built TextKit 1 view honours the Wrap Detail Lines setting
+    // (applyDetailWrap).
     private let textView: SpeedSearchTextView = {
         let huge = CGFloat.greatestFiniteMagnitude
         let storage = NSTextStorage()
@@ -300,9 +302,9 @@ final class DetailPaneView: NSView {
     }
 
     /// Show the interactive shell view for a pod (idempotent — keeps a live session).
-    func configureShell(context: String, namespace: String, pod: String, isProduction: Bool) {
+    func configureShell(context: String, namespace: String, pod: String, container: String?, isProduction: Bool) {
         show(.shell)
-        shellView.configure(context: context, namespace: namespace, pod: pod, isProduction: isProduction)
+        shellView.configure(context: context, namespace: namespace, pod: pod, container: container, isProduction: isProduction)
     }
     /// Kill the shell's child process (no-op if not running).
     func stopShell() { shellView.stop() }
@@ -357,7 +359,7 @@ final class DetailPaneView: NSView {
         }
     }
 
-    /// Which content view is visible (text / Top table / node pods / inventory / metrics).
+    /// Which content view is visible (text / top / nodePods / inventory / events / liveLog / metrics / shell).
     private enum Content { case text, top, nodePods, inventory, events, liveLog, metrics, shell }
     private func show(_ content: Content) {
         scroll.isHidden = content != .text
@@ -709,7 +711,7 @@ enum DescribeFormatter {
 
                 if value.isEmpty {
                     // A header: top-level section (Containers:/Events:…) or a nested
-                    // block name (a container/volume name) — bold, coloured by level.
+                    // block name (a container/volume name) — bold label colour vs teal, not bold.
                     add(key + ":", indent.isEmpty ? sectionAttrs : subHeaderAttrs)
                 } else if afterColon.first == " ", !key.contains("  ") {
                     // A real "key: value": tabwriter always puts a space after the

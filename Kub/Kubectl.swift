@@ -239,18 +239,13 @@ final class Kubectl: Sendable {
 
     init(gateLimit: Int = 6) {
         gate = ConcurrencyGate(limit: gateLimit)
-        let candidates = ["/usr/local/bin/kubectl", "/opt/homebrew/bin/kubectl"]
-        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            executableURL = URL(fileURLWithPath: found)
-            prefixArgs = []
-        } else {
-            executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            prefixArgs = ["kubectl"]
-        }
+        let (path, prefix) = Self.resolvedExecutable()
+        executableURL = URL(fileURLWithPath: path)
+        prefixArgs = prefix
     }
 
-    /// Resolved kubectl invocation for callers that spawn it themselves (the shell
-    /// PTY): an absolute path when found (so no PATH lookup is needed — a bare
+    /// Resolved kubectl invocation — for `run`/`stream` and for callers that spawn it
+    /// themselves (the shell PTY): an absolute path when found (so no PATH lookup is needed — a bare
     /// `env kubectl` fails when the child PATH isn't right), else the env fallback.
     static func resolvedExecutable() -> (path: String, prefix: [String]) {
         let candidates = ["/usr/local/bin/kubectl", "/opt/homebrew/bin/kubectl"]
@@ -262,9 +257,9 @@ final class Kubectl: Sendable {
 
     /// `timeout` hard-bounds the process (a watchdog SIGTERMs, then SIGKILLs it),
     /// so a stalled call can't hold its gate slot forever. Reads default to 30s;
-    /// long diagnostics pass their own (minutes). This is the backstop for
-    /// `--request-timeout` not covering the exec-auth plugin (`aws eks get-token`),
-    /// which hangs offline. Task cancellation terminates the spawned kubectl and
+    /// long diagnostics pass their own (minutes). This is the backstop for what
+    /// `--request-timeout` doesn't cover: the exec-auth plugin (`aws eks get-token`,
+    /// hangs offline) and whole `exec`/`cp` sessions (verified: it doesn't bound them). Task cancellation terminates the spawned kubectl and
     /// throws `CancellationError` (any in-cluster effect may still land).
     func run(_ args: [String], timeout: TimeInterval = 30, highPriority: Bool = false) async throws -> Data {
         try Task.checkCancellation()   // abandoned work shouldn't wait for (or take) a slot
@@ -291,17 +286,55 @@ final class Kubectl: Sendable {
         return handle
     }
 
-    /// GUI launches get a minimal PATH without /opt/homebrew/bin etc. — where the
-    /// `aws` exec-credential plugin lives. Augment it so kubectl can find them.
+    /// GUI launches get launchd's minimal PATH, without /opt/homebrew/bin etc. — where
+    /// the `aws` exec-credential plugin lives. Augment it with the usual locations plus
+    /// whatever the user's login shell puts on PATH, so kubectl can find the plugins.
     static func augmentedEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         let home = NSHomeDirectory()
-        var paths = ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin",
-                     "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-        if let existing = env["PATH"], !existing.isEmpty { paths.append(existing) }
-        env["PATH"] = paths.joined(separator: ":")
+        var paths = ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin"]
+        if let login = loginShellPath { paths += login.split(separator: ":").map(String.init) }
+        paths += ["\(home)/.rd/bin", "\(home)/.krew/bin", "/opt/local/bin",
+                  "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        if let existing = env["PATH"], !existing.isEmpty { paths += existing.split(separator: ":").map(String.init) }
+        var seen = Set<String>()
+        env["PATH"] = paths.filter { !$0.isEmpty && seen.insert($0).inserted }.joined(separator: ":")
         return env
     }
+
+    /// PATH as the user's login shell sees it, probed once (`$SHELL -lc`, 3s cap).
+    /// Exec-auth plugins live wherever dotfiles put them — asdf/mise shims,
+    /// `google-cloud-sdk/bin` (`gke-gcloud-auth-plugin`), `~/.rd/bin` — and no fixed
+    /// list covers that. nil when the shell is missing, prints nothing or hangs.
+    private static let loginShellPath: String? = {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
+        let marker = "__KUB_PATH__"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.arguments = ["-lc", "printf '\(marker)%s' \"$PATH\""]
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        do { try process.run() } catch { return nil }
+        let box = DataBox()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            box.data = pipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        if group.wait(timeout: .now() + 3) != .success {   // a prompting dotfile would hang us
+            terminateWithEscalation(process)
+            return nil
+        }
+        process.waitUntilExit()
+        let out = String(decoding: box.data, as: UTF8.self)
+        guard let r = out.range(of: marker) else { return nil }
+        let path = out[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
+    }()
 
     private func execute(_ args: [String], timeout: TimeInterval) async throws -> Data {
         let exe = executableURL
@@ -338,9 +371,9 @@ final class Kubectl: Sendable {
 
                     // Watchdog: SIGTERM (then SIGKILL) the process if it overruns `timeout`.
                     // `--request-timeout` bounds the API request but NOT the exec-auth plugin
-                    // (`aws eks get-token`), which hangs when the network drops — and a hung
-                    // process would hold this gate slot indefinitely, stalling the whole app
-                    // once all slots are taken.
+                    // (`aws eks get-token`, hangs when the network drops) nor an exec/cp
+                    // session — and a hung process would hold this gate slot indefinitely,
+                    // stalling the whole app once all slots are taken.
                     let watchdog = DispatchWorkItem { terminateWithEscalation(process) }
                     DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
 

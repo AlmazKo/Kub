@@ -55,7 +55,7 @@ final class PortForwardController {
         guard Self.canForward(row.kind), viewModel.selectedContext != nil else { return }
         pendingRow = row
 
-        let title = NSTextField(labelWithString: "Port-forward \(row.kind.singularName) “\(row.name)”")
+        let title = NSTextField(labelWithString: "Port-forward \(row.kind.displaySingular) “\(row.name)”")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.lineBreakMode = .byTruncatingMiddle
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)

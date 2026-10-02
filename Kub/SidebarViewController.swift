@@ -1,7 +1,8 @@
 import AppKit
 
 /// Left navigation: a flat, native source list of resource kinds (with element
-/// counts), split into sections by thin dividers — no headers, no collapsing.
+/// counts): enabled kinds, one thin divider, then the hidden kinds — no headers,
+/// no collapsing.
 /// Kinds can be hidden (right-click): hidden kinds render dimmed/compact and are
 /// never queried.
 final class SidebarViewController: NSViewController {

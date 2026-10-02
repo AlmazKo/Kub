@@ -33,9 +33,9 @@ final class MetricBarView: NSView {
     }
 }
 
-/// The indicator panel above the process table: per-container CPU/MEM (share of
-/// node), and node CPU / memory / load from the `top` header — each as a labeled
-/// bar. Falls back to muted notes when metrics or exec are unavailable.
+/// The indicator panel above the process table: per-container CPU/Mem usage against
+/// the pod's request, and node CPU / memory / load from the `top` header — each as a
+/// labeled bar. Falls back to muted notes when metrics or exec are unavailable.
 final class TopSummaryView: NSView {
     private let stack = NSStackView()
     private static let captionWidth: CGFloat = 84
@@ -107,25 +107,27 @@ final class TopSummaryView: NSView {
                        tooltip: "usr \(Self.pct(cpu.usr)) · sys \(Self.pct(cpu.sys)) · io \(Self.pct(cpu.io)) · idle \(Self.pct(cpu.idle))")
             }
 
+            // Headline = app memory (the solid segment); page cache is reclaimable, so
+            // it's drawn translucent and counted only in the tooltip's "used".
             if let mem = node.mem, mem.totalBytes > 0 {
-                let app = max(0, mem.usedBytes - mem.cacheBytes)
                 let bar = MetricBarView()
                 bar.segments = [
-                    .init(fraction: app / mem.totalBytes, color: .systemBlue),
+                    .init(fraction: mem.appBytes / mem.totalBytes, color: .systemBlue),
                     .init(fraction: mem.cacheBytes / mem.totalBytes,
                           color: NSColor.systemBlue.withAlphaComponent(0.3)),
                 ]
-                let pct = mem.usedBytes / mem.totalBytes * 100
+                let pct = mem.appBytes / mem.totalBytes * 100
                 addRow(caption: "Mem", bar: bar,
-                       value: "\(Self.bytes(mem.usedBytes)) / \(Self.bytes(mem.totalBytes))  \(Int(pct.rounded()))%",
+                       value: "\(Self.bytes(mem.appBytes)) / \(Self.bytes(mem.totalBytes))  \(Int(pct.rounded()))%",
                        valueColor: Self.level(pct, warn: 80, crit: 92),
-                       tooltip: "used \(Self.bytes(mem.usedBytes)) · cache \(Self.bytes(mem.cacheBytes)) · free \(Self.bytes(mem.freeBytes))")
+                       tooltip: "apps \(Self.bytes(mem.appBytes)) · cache \(Self.bytes(mem.cacheBytes)) · free \(Self.bytes(mem.freeBytes)) · used incl. cache \(Self.bytes(mem.usedBytes))")
             }
 
             if !node.load.isEmpty {
                 let text = node.load.map { String(format: "%.2f", $0) }.joined(separator: "   ")
-                addRow(caption: "Load", bar: nil, value: text,
-                       tooltip: "load average · 1 / 5 / 15 min")
+                var tip = "load average · 1 / 5 / 15 min"
+                if let t = node.tasks, t.total > 0 { tip += " · \(t.total) tasks, \(t.running) running" }
+                addRow(caption: "Load", bar: nil, value: text, tooltip: tip)
             }
         }
 

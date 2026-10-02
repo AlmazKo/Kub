@@ -18,9 +18,9 @@ final class ActionTableView: SpeedSearchTableView {
 }
 
 /// Main cluster view: one sortable table of the selected `ResourceKind` across
-/// all namespaces. Grouping by namespace is an option; search and "hide system
-/// namespaces" filter the rows; each row carries a mini action button; a bottom
-/// bar shows the currently running kubectl command.
+/// all namespaces. Rows group by namespace / status / node / workload (collapsible);
+/// search and "hide system namespaces" filter them; each row carries a mini action
+/// button; a bottom bar shows the in-flight kubectl commands (latest + "+N more").
 final class ResourceListViewController: NSViewController {
     private enum Item {
         case group(String)
@@ -108,7 +108,7 @@ final class ResourceListViewController: NSViewController {
     var onReloadRequested: (() -> Void)?
     /// Fired by the "No matches" card's Clear-filter button.
     var onClearFilter: (() -> Void)?
-    /// Fired by the empty card's "Show all" button to turn off the bookmark filter.
+    /// Fired by the empty card's "Show All" button to turn off the bookmark filter.
     var onClearBookmarkFilter: (() -> Void)?
     /// Speed-search on the main table → the toolbar filter field (typing / Esc).
     var onTableTypeSearch: ((String) -> Void)?
@@ -122,7 +122,7 @@ final class ResourceListViewController: NSViewController {
     var onOpenResource: ((ResourceKind, String, String) -> Void)?
     /// Fired when the Metrics tab requests a (re)scrape of a specific endpoint.
     var onReloadMetrics: ((MetricEndpoint) -> Void)?
-    /// Pod key to select once it appears (used when jumping from a node to Pods).
+    /// Row key to select once it appears (node → pod, namespace inventory and kub:// jumps).
     private var pendingReveal: String?
     /// True while we set the selection ourselves, so the delegate can tell a
     /// programmatic reselect from a real user click.
@@ -278,8 +278,8 @@ final class ResourceListViewController: NSViewController {
     func setDetailInventoryLoading() { detailPane.setInventoryLoading("Loading resources…") }
     func startDetailLiveLog() { detailPane.startLiveLog() }
     func appendDetailLiveLog(_ lines: [String]) { detailPane.appendLiveLog(lines) }
-    func configureDetailShell(context: String, namespace: String, pod: String, isProduction: Bool) {
-        detailPane.configureShell(context: context, namespace: namespace, pod: pod, isProduction: isProduction)
+    func configureDetailShell(context: String, namespace: String, pod: String, container: String?, isProduction: Bool) {
+        detailPane.configureShell(context: context, namespace: namespace, pod: pod, container: container, isProduction: isProduction)
     }
     func stopDetailShell() { detailPane.stopShell() }
 
@@ -619,9 +619,9 @@ final class ResourceListViewController: NSViewController {
             emptyLabel.textColor = .labelColor
             // Offer a reset for whichever filter is actually the cause.
             if !query.trimmingCharacters(in: .whitespaces).isEmpty {
-                emptyLabel.setActionButton("Clear filter") { [weak self] in self?.onClearFilter?() }
+                emptyLabel.setActionButton("Clear Filter") { [weak self] in self?.onClearFilter?() }
             } else if pinnedOnly {
-                emptyLabel.setActionButton("Show all") { [weak self] in self?.onClearBookmarkFilter?() }
+                emptyLabel.setActionButton("Show All") { [weak self] in self?.onClearBookmarkFilter?() }
             } else {
                 emptyLabel.setActionButton(nil)
             }
@@ -690,21 +690,21 @@ final class ResourceListViewController: NSViewController {
         guard rowIndex >= 0, rowIndex < items.count, case let .row(row) = items[rowIndex] else { return nil }
         let menu = NSMenu()
         if let action = row.kind.primaryAction {
-            let title = "\(action.title) \(row.kind.singularName.capitalized)…"
+            let title = "\(action.title) \(row.kind.displaySingular)…"
             let item = NSMenuItem(title: title, action: #selector(primaryActionFromMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = row
             menu.addItem(item)
         }
         if row.kind.scalable {
-            let scale = NSMenuItem(title: "Scale \(row.kind.singularName.capitalized)…",
+            let scale = NSMenuItem(title: "Scale \(row.kind.displaySingular)…",
                                    action: #selector(scaleFromMenu(_:)), keyEquivalent: "")
             scale.target = self
             scale.representedObject = row
             menu.addItem(scale)
         }
         if row.kind.rollbackable {
-            let rb = NSMenuItem(title: "Roll Back \(row.kind.singularName.capitalized)…",
+            let rb = NSMenuItem(title: "Roll Back \(row.kind.displaySingular)…",
                                 action: #selector(rollbackFromMenu(_:)), keyEquivalent: "")
             rb.target = self
             rb.representedObject = row
@@ -854,7 +854,7 @@ extension ResourceListViewController: NSTableViewDataSource, NSTableViewDelegate
         guard let action = item.kind.primaryAction else { return NSView() }
         let symbol = action == .delete ? "trash" : "arrow.clockwise"
         let tint: NSColor = action == .delete ? .systemRed : .controlAccentColor
-        let tip = "\(action.title) \(item.kind.singularName)"
+        let tip = "\(action.title) \(item.kind.displaySingular)"
         cell.configure(symbol: symbol, tooltip: tip, tint: tint) { [weak self] in
             self?.onPrimaryAction?(item)
         }
@@ -910,10 +910,10 @@ extension ResourceListViewController: NSTableViewDataSource, NSTableViewDelegate
 }
 
 /// A namespace label with a clickable bookmark that pins/unpins it on the spot.
-/// Reused anywhere a namespace name is shown — a grouped table's group header
-/// (`header: true`) and a row in the Namespaces table (`header: false`) — so the
-/// bookmark appears everywhere there's a namespace. Filled/accent when pinned,
-/// hollow/secondary when not; white on a selected row.
+/// Reused anywhere a namespace name is shown — a namespace group header (dimmed)
+/// and a row in the Namespaces table (not dimmed) — so the bookmark appears
+/// everywhere there's a namespace. Always the outline paw: accent stroke when
+/// pinned, tertiary (secondary on hover) when not; white on a selected row.
 final class NamespaceBookmarkCell: NSTableCellView {
     static let id = NSUserInterfaceItemIdentifier("NamespaceBookmarkCell")
     private let chevron = GroupDisclosure()

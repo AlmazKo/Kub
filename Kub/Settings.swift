@@ -28,7 +28,7 @@ enum Settings {
     }
 
     /// Soft-wrap long lines in the plain-text detail views (Overview / Why /
-    /// Containers / History / Events / Mounts). Off by default → no wrap, with a
+    /// Containers / History / Mounts). Off by default → no wrap, with a
     /// horizontal scroller. (The Logs tab has its own in-place Wrap toggle.)
     static var wrapDetailText: Bool {
         get { UserDefaults.standard.bool(forKey: wrapKey) }   // default: false (no wrap)

@@ -60,6 +60,7 @@ struct PodSpec: Decodable, Sendable {
 struct NamedContainer: Decodable, Sendable {
     let name: String
     let image: String?
+    let restartPolicy: String?   // init containers only: "Always" = restartable (a sidecar)
     let ports: [ContainerPort]?
     let resources: ResourceRequirements?
     let volumeMounts: [VolumeMount]?
@@ -173,6 +174,7 @@ struct ContainerStatus: Decodable, Sendable {
     let name: String
     let image: String?
     let ready: Bool?
+    let started: Bool?               // startup probe passed (false while it's still pending)
     let restartCount: Int?
     let state: ContainerState?
     let lastState: ContainerState?   // previous run — where a recovered OOM/crash lives
@@ -296,12 +298,6 @@ struct K8sConfigMap: Decodable, Sendable {
     let binaryData: [String: String]?
 }
 
-struct K8sSecret: Decodable, Sendable {
-    let metadata: ObjectMeta
-    let type: String?
-    let data: [String: String]?
-}
-
 // MARK: - Network
 
 struct K8sService: Decodable, Sendable {
@@ -394,6 +390,8 @@ struct K8sJob: Decodable, Sendable {
 
 struct JobSpec: Decodable, Sendable {
     let completions: Int?
+    let parallelism: Int?
+    let suspend: Bool?
 }
 
 struct JobStatus: Decodable, Sendable {
@@ -451,6 +449,16 @@ struct HPASpec: Decodable, Sendable {
 struct HPAStatus: Decodable, Sendable {
     let currentReplicas: Int?
     let desiredReplicas: Int?
+    let conditions: [HPACondition]?
+}
+
+/// `AbleToScale` / `ScalingActive` / `ScalingLimited` — a False `ScalingActive` is how
+/// a missing metrics API or an unreadable target shows up.
+struct HPACondition: Decodable, Sendable {
+    let type: String?
+    let status: String?
+    let reason: String?
+    let message: String?
 }
 
 // MARK: - Namespaces (cluster-scoped)
@@ -468,7 +476,19 @@ struct NamespaceStatus: Decodable, Sendable {
 
 struct K8sNode: Decodable, Sendable {
     let metadata: ObjectMeta
+    let spec: NodeSpec?
     let status: NodeStatus?
+}
+
+struct NodeSpec: Decodable, Sendable {
+    let unschedulable: Bool?      // cordoned → ",SchedulingDisabled"
+    let taints: [NodeTaint]?
+}
+
+struct NodeTaint: Decodable, Sendable {
+    let key: String?
+    let value: String?
+    let effect: String?           // NoSchedule / PreferNoSchedule / NoExecute
 }
 
 struct NodeStatus: Decodable, Sendable {
@@ -488,16 +508,30 @@ struct NodeCondition: Decodable, Sendable {
 
 // MARK: - Events (core/v1)
 
+/// Read through core/v1, but events emitted via events.k8s.io arrive with the *new*
+/// fields instead: `eventTime` + `series` (count/lastObservedTime) in place of
+/// `firstTimestamp`/`lastTimestamp`/`count` (which come back zero), and
+/// `reportingComponent`/`reportingInstance` in place of `source`.
 struct K8sEvent: Decodable, Sendable {
     let metadata: ObjectMeta
     let type: String?
     let reason: String?
+    let action: String?
     let message: String?
     let count: Int?
     let firstTimestamp: String?
     let lastTimestamp: String?
+    let eventTime: String?            // MicroTime — fractional seconds
+    let series: EventSeries?
     let involvedObject: InvolvedObject?
     let source: EventSource?
+    let reportingComponent: String?
+    let reportingInstance: String?
+}
+
+struct EventSeries: Decodable, Sendable {
+    let count: Int?
+    let lastObservedTime: String?     // MicroTime
 }
 
 struct InvolvedObject: Decodable, Sendable {
@@ -545,6 +579,49 @@ struct NetworkPolicySpec: Decodable, Sendable {
 }
 struct LabelSelector: Decodable, Sendable {
     let matchLabels: [String: String]?
+    let matchExpressions: [LabelSelectorRequirement]?
+
+    /// True when `matchLabels` is empty AND there are no expressions — selects everything.
+    var isEmpty: Bool { (matchLabels ?? [:]).isEmpty && (matchExpressions ?? []).isEmpty }
+
+    /// Full label-selector semantics: every matchLabels pair AND every expression must hold.
+    func matches(_ labels: [String: String]) -> Bool {
+        for (k, v) in matchLabels ?? [:] where labels[k] != v { return false }
+        for req in matchExpressions ?? [] where !req.matches(labels) { return false }
+        return true
+    }
+
+    /// `kubectl`-style rendering (`metav1.FormatLabelSelector`): `a=b,env in (x,y),tier`.
+    var formatted: String {
+        var parts = (matchLabels ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        for req in matchExpressions ?? [] {
+            let values = (req.values ?? []).sorted().joined(separator: ",")
+            switch req.operator {
+            case "In": parts.append("\(req.key) in (\(values))")
+            case "NotIn": parts.append("\(req.key) notin (\(values))")
+            case "Exists": parts.append(req.key)
+            case "DoesNotExist": parts.append("!\(req.key)")
+            default: parts.append("\(req.key) \(req.operator) (\(values))")
+            }
+        }
+        return parts.joined(separator: ",")
+    }
+}
+
+struct LabelSelectorRequirement: Decodable, Sendable {
+    let key: String
+    let `operator`: String   // In / NotIn / Exists / DoesNotExist
+    let values: [String]?
+
+    func matches(_ labels: [String: String]) -> Bool {
+        switch `operator` {
+        case "In": return labels[key].map { (values ?? []).contains($0) } ?? false
+        case "NotIn": return labels[key].map { !(values ?? []).contains($0) } ?? true
+        case "Exists": return labels[key] != nil
+        case "DoesNotExist": return labels[key] == nil
+        default: return false
+        }
+    }
 }
 
 // MARK: - Prometheus Operator monitors (CRDs; absent on clusters without the operator)
@@ -563,8 +640,23 @@ struct K8sPodMonitor: Decodable, Sendable {
 
 struct MonitorSpec: Decodable, Sendable {
     let selector: LabelSelector?
+    /// Which namespaces the monitor selects targets from. Absent → the monitor's own
+    /// namespace (the operator's default); `any: true` → every namespace.
+    let namespaceSelector: MonitorNamespaceSelector?
     let endpoints: [MonitorEndpoint]?             // ServiceMonitor
     let podMetricsEndpoints: [MonitorEndpoint]?   // PodMonitor
+}
+
+struct MonitorNamespaceSelector: Decodable, Sendable {
+    let any: Bool?
+    let matchNames: [String]?
+
+    /// Does a monitor living in `monitorNamespace` select targets in `target`?
+    func selects(_ target: String, monitorNamespace: String) -> Bool {
+        if any == true { return true }
+        if let names = matchNames, !names.isEmpty { return names.contains(target) }
+        return target == monitorNamespace
+    }
 }
 
 struct MonitorEndpoint: Decodable, Sendable {

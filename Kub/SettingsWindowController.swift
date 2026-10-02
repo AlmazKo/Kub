@@ -32,8 +32,8 @@ final class SettingsWindowController: NSWindowController {
 
         let desc = NSTextField(wrappingLabelWithString:
             "Adds a JDK submenu when you right-click a process in a pod’s Top tab: "
-          + "capture a JVM heap dump (jcmd GC.heap_dump) or an async-profiler flame "
-          + "graph. Requires a linux/amd64 JVM pod; async-profiler "
+          + "capture a JVM heap dump (jcmd GC.heap_dump) or an async-profiler recording "
+          + "(JFR). Requires a Linux JVM pod (x64 or arm64); async-profiler "
           + "\(DiagnosticPaths.asyncProfilerVersion) is bundled in the app. Profiles are "
           + "written to /tmp/kub/profiles.")
         desc.font = .systemFont(ofSize: 11)

@@ -11,7 +11,7 @@ enum StatusKind: Sendable {
     case terminating
     case completed
     case unknown
-    case neutral   // resources without a health concept (config/secret) → kind icon
+    case neutral   // resources without a health concept (config/secret) → plain text, no icon
 
     var symbolName: String {
         switch self {
@@ -69,7 +69,7 @@ enum PrimaryAction: Sendable {
 /// A column in the resource table. `id` doubles as the lookup key into `ResourceRow.value`.
 struct ResourceColumn: Sendable {
     enum Style: Sendable {
-        case status      // SF Symbol (from row.statusKind) + namespace text
+        case status      // name text; + SF Symbol (row.statusKind) only when the kind has no Status column
         case statusText  // colored status word
         case plain       // plain text (name)
         case mono        // monospaced-digit numeric column
@@ -99,19 +99,6 @@ enum ResourceKind: String, CaseIterable, Sendable {
     // Cluster
     case nodes, events, namespaces
 
-    /// Sidebar section index — a thin divider is drawn where this changes.
-    var section: Int {
-        switch self {
-        case .pods, .deployments, .statefulSets, .replicaSets, .daemonSets: return 0
-        case .configMaps, .secrets, .serviceAccounts: return 1
-        case .services, .ingresses, .networkPolicies, .endpoints: return 2
-        case .persistentVolumeClaims, .persistentVolumes, .storageClasses: return 3
-        case .jobs, .cronJobs: return 4
-        case .horizontalPodAutoscalers, .podDisruptionBudgets: return 5
-        case .nodes, .events, .namespaces: return 6
-        }
-    }
-
     /// Cluster-scoped kinds have no namespace — never grouped by it, and `-A` is
     /// invalid for them.
     var isNamespaced: Bool {
@@ -138,7 +125,7 @@ enum ResourceKind: String, CaseIterable, Sendable {
     }
 
     /// Whether the UI groups rows under namespace headers. Events read better as a
-    /// flat newest-first stream; nodes/namespaces have no namespace.
+    /// flat newest-first stream; cluster-scoped kinds have no namespace.
     var groupsByNamespace: Bool {
         switch self {
         case .nodes, .events, .namespaces, .persistentVolumes, .storageClasses: return false
@@ -181,7 +168,36 @@ enum ResourceKind: String, CaseIterable, Sendable {
         }
     }
 
-    /// Singular, lowercase — used in kubectl commands and dialog text.
+    /// Singular, properly cased — for menus, confirms and tooltips ("Delete PVC…",
+    /// "Scale StatefulSet…"); `singularName` is the kubectl spelling.
+    var displaySingular: String {
+        switch self {
+        case .pods: return "Pod"
+        case .deployments: return "Deployment"
+        case .statefulSets: return "StatefulSet"
+        case .replicaSets: return "ReplicaSet"
+        case .daemonSets: return "DaemonSet"
+        case .configMaps: return "ConfigMap"
+        case .secrets: return "Secret"
+        case .services: return "Service"
+        case .ingresses: return "Ingress"
+        case .persistentVolumeClaims: return "PVC"
+        case .jobs: return "Job"
+        case .cronJobs: return "CronJob"
+        case .serviceAccounts: return "ServiceAccount"
+        case .horizontalPodAutoscalers: return "HPA"
+        case .nodes: return "Node"
+        case .events: return "Event"
+        case .namespaces: return "Namespace"
+        case .networkPolicies: return "NetworkPolicy"
+        case .endpoints: return "Endpoints"
+        case .persistentVolumes: return "PersistentVolume"
+        case .storageClasses: return "StorageClass"
+        case .podDisruptionBudgets: return "PodDisruptionBudget"
+        }
+    }
+
+    /// Singular, lowercase — the kubectl resource spelling (`describe <singularName>`).
     var singularName: String {
         switch self {
         case .pods: return "pod"
@@ -236,6 +252,57 @@ enum ResourceKind: String, CaseIterable, Sendable {
         }
     }
 
+    /// The API `kind` (as in `involvedObject.kind` / `ownerReferences[].kind`).
+    var apiKind: String {
+        switch self {
+        case .pods: return "Pod"
+        case .deployments: return "Deployment"
+        case .statefulSets: return "StatefulSet"
+        case .replicaSets: return "ReplicaSet"
+        case .daemonSets: return "DaemonSet"
+        case .configMaps: return "ConfigMap"
+        case .secrets: return "Secret"
+        case .services: return "Service"
+        case .ingresses: return "Ingress"
+        case .persistentVolumeClaims: return "PersistentVolumeClaim"
+        case .jobs: return "Job"
+        case .cronJobs: return "CronJob"
+        case .serviceAccounts: return "ServiceAccount"
+        case .horizontalPodAutoscalers: return "HorizontalPodAutoscaler"
+        case .nodes: return "Node"
+        case .events: return "Event"
+        case .namespaces: return "Namespace"
+        case .networkPolicies: return "NetworkPolicy"
+        case .endpoints: return "Endpoints"
+        case .persistentVolumes: return "PersistentVolume"
+        case .storageClasses: return "StorageClass"
+        case .podDisruptionBudgets: return "PodDisruptionBudget"
+        }
+    }
+
+    /// REST list path across all namespaces (`kubectl get --raw <apiPath>?limit=1` is
+    /// how the sidebar counts are read: `metadata.remainingItemCount` instead of
+    /// downloading every object).
+    var apiPath: String {
+        switch self {
+        case .pods, .configMaps, .secrets, .services, .persistentVolumeClaims, .serviceAccounts,
+             .events, .endpoints, .nodes, .namespaces, .persistentVolumes:
+            return "/api/v1/\(kubectlResource)"
+        case .deployments, .statefulSets, .replicaSets, .daemonSets:
+            return "/apis/apps/v1/\(kubectlResource)"
+        case .jobs, .cronJobs:
+            return "/apis/batch/v1/\(kubectlResource)"
+        case .ingresses, .networkPolicies:
+            return "/apis/networking.k8s.io/v1/\(kubectlResource)"
+        case .horizontalPodAutoscalers:
+            return "/apis/autoscaling/v2/\(kubectlResource)"
+        case .podDisruptionBudgets:
+            return "/apis/policy/v1/\(kubectlResource)"
+        case .storageClasses:
+            return "/apis/storage.k8s.io/v1/\(kubectlResource)"
+        }
+    }
+
     var symbol: String {
         switch self {
         case .pods: return "cube"
@@ -284,8 +351,9 @@ enum ResourceKind: String, CaseIterable, Sendable {
         }
     }
 
-    /// Data columns for a row. The namespace is rendered as a group header, so
-    /// the status icon lives on the name column instead of a separate namespace one.
+    /// Data columns for a row. The namespace is a group header (or an auto-inserted
+    /// column when not grouped by namespace); the health icon lives in the Status
+    /// column, or on the name for kinds without one.
     var columns: [ResourceColumn] {
         let status = ResourceColumn(id: "status", title: "Status", width: 150, minWidth: 104, style: .statusText)
         let age = ResourceColumn(id: "age", title: "Age", width: 64, minWidth: 48, style: .mono)
@@ -342,7 +410,7 @@ enum ResourceKind: String, CaseIterable, Sendable {
         case .serviceAccounts:
             return [name("ServiceAccount"), mono("secrets", "Secrets", 64, 50), age]
         case .horizontalPodAutoscalers:
-            return [name("HPA"), mono("min", "Min", 50, 44), mono("max", "Max", 50, 44),
+            return [name("HPA"), status, mono("min", "Min", 50, 44), mono("max", "Max", 50, 44),
                     plain("replicas", "Replicas", 80, 60), age]
         case .nodes:
             return [name("Node"), status,

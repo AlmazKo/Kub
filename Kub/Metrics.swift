@@ -33,8 +33,8 @@ struct MetricsReport: Sendable {
 
 // MARK: - Endpoint discovery
 
-/// Prometheus-Operator monitors + Services in a namespace, used to resolve a pod's
-/// scrape endpoint authoritatively. Best-effort — empty on clusters without the operator.
+/// Prometheus-Operator monitors (from every namespace) + the pod namespace's Services,
+/// used to resolve a pod's scrape endpoint authoritatively. Best-effort — empty on clusters without the operator.
 struct MetricsSources: Sendable {
     var serviceMonitors: [K8sServiceMonitor] = []
     var podMonitors: [K8sPodMonitor] = []
@@ -53,14 +53,24 @@ enum MetricsDiscovery {
 
     /// Resolution order: (1) a ServiceMonitor/PodMonitor that targets this pod — the
     /// authoritative source, since it's exactly what Prometheus scrapes (exact port
-    /// AND path); (2) `prometheus.io/port` annotation; (3) a container port named
-    /// *metrics*/*prom*; (4) a best-effort guess (management/http port → first port → 8080).
+    /// AND path); (2) `prometheus.io/port` annotation on the pod, then on a Service
+    /// that selects it; (3) a container port named *metrics*/*prom*; (4) a best-effort
+    /// guess (management/http port → first port → 8080).
     static func discover(pod: K8sPod, sources: MetricsSources) -> Guess {
         let labels = pod.metadata.labels ?? [:]
+        let podNamespace = pod.metadata.namespace ?? ""
         let ports = (pod.spec?.containers ?? []).flatMap { $0.ports ?? [] }
+        // Services (in the pod's namespace) whose selector picks this pod.
+        let frontingServices = sources.services.filter { svc in
+            let sel = svc.spec?.selector ?? [:]
+            return !sel.isEmpty && isSubset(sel, of: labels)
+        }
 
-        // (1a) PodMonitor — selector matches the pod's labels directly.
-        for pm in sources.podMonitors where selectorMatches(pm.spec?.selector, labels) {
+        // (1a) PodMonitor — selector matches the pod's labels directly. Monitors come
+        // from every namespace; `namespaceSelector` decides whether this one applies.
+        for pm in sources.podMonitors
+        where targets(pm.spec, monitorNamespace: pm.metadata.namespace ?? "", podNamespace)
+            && selectorMatches(pm.spec?.selector, labels) {
             for ep in pm.spec?.podMetricsEndpoints ?? [] {
                 if let port = resolvePort(ep, containerPorts: ports, servicePorts: nil) {
                     return Guess(endpoint: MetricEndpoint(port: port, path: normalizePath(ep.path)), confident: true)
@@ -68,11 +78,9 @@ enum MetricsDiscovery {
             }
         }
         // (1b) ServiceMonitor — selector matches a Service that fronts this pod.
-        for sm in sources.serviceMonitors {
-            guard let sel = sm.spec?.selector?.matchLabels, !sel.isEmpty else { continue }
-            for svc in sources.services where isSubset(sel, of: svc.metadata.labels ?? [:]) {
-                let svcSelector = svc.spec?.selector ?? [:]
-                guard !svcSelector.isEmpty, isSubset(svcSelector, of: labels) else { continue }
+        for sm in sources.serviceMonitors
+        where targets(sm.spec, monitorNamespace: sm.metadata.namespace ?? "", podNamespace) {
+            for svc in frontingServices where selectorMatches(sm.spec?.selector, svc.metadata.labels ?? [:]) {
                 for ep in sm.spec?.endpoints ?? [] {
                     if let port = resolvePort(ep, containerPorts: ports, servicePorts: svc.spec?.ports) {
                         return Guess(endpoint: MetricEndpoint(port: port, path: normalizePath(ep.path)), confident: true)
@@ -81,11 +89,25 @@ enum MetricsDiscovery {
             }
         }
 
-        // (2) prometheus.io/port annotation.
+        // (2) prometheus.io/port annotation — on the pod, else on a fronting Service
+        // (the `kubernetes-service-endpoints` scrape convention). A Service's annotated
+        // port may be its own port number rather than the container's; map it through.
         let ann = pod.metadata.annotations ?? [:]
         let annPath = normalizePath(ann["prometheus.io/path"])
         if let raw = ann["prometheus.io/port"], let port = Int(raw.trimmingCharacters(in: .whitespaces)) {
             return Guess(endpoint: MetricEndpoint(port: port, path: annPath), confident: true)
+        }
+        for svc in frontingServices {
+            let sann = svc.metadata.annotations ?? [:]
+            guard sann["prometheus.io/scrape"] != "false",
+                  let raw = sann["prometheus.io/port"], let n = Int(raw.trimmingCharacters(in: .whitespaces)) else { continue }
+            var port = n
+            if !ports.contains(where: { $0.containerPort == n }),
+               let sp = (svc.spec?.ports ?? []).first(where: { $0.port == n }),
+               let tp = sp.targetPort?.text, !tp.isEmpty {
+                port = Int(tp) ?? ports.first(where: { $0.name == tp })?.containerPort ?? n
+            }
+            return Guess(endpoint: MetricEndpoint(port: port, path: normalizePath(sann["prometheus.io/path"])), confident: true)
         }
         // (3) A container port explicitly named for metrics.
         if let named = ports.first(where: {
@@ -108,11 +130,18 @@ enum MetricsDiscovery {
         return Guess(endpoint: MetricEndpoint(port: 8080, path: "/metrics"), confident: false)
     }
 
-    /// A monitor selector matches iff its (non-empty) matchLabels are all present on
-    /// the target. Empty selectors are treated as no-match (never auto-hijack).
+    /// A monitor selector matches iff it is non-empty and its matchLabels AND
+    /// matchExpressions all hold. Empty selectors are no-match (never auto-hijack).
     private static func selectorMatches(_ selector: LabelSelector?, _ labels: [String: String]) -> Bool {
-        guard let ml = selector?.matchLabels, !ml.isEmpty else { return false }
-        return isSubset(ml, of: labels)
+        guard let selector, !selector.isEmpty else { return false }
+        return selector.matches(labels)
+    }
+
+    /// Does a monitor in `monitorNamespace` select targets in `podNamespace`? No
+    /// `namespaceSelector` means the monitor's own namespace (the operator's default).
+    private static func targets(_ spec: MonitorSpec?, monitorNamespace: String, _ podNamespace: String) -> Bool {
+        spec?.namespaceSelector?.selects(podNamespace, monitorNamespace: monitorNamespace)
+            ?? (monitorNamespace == podNamespace)
     }
 
     private static func isSubset(_ sub: [String: String], of sup: [String: String]) -> Bool {

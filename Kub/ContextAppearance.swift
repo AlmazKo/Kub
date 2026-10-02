@@ -80,7 +80,7 @@ enum ResourceKindStore {
     }
 
     static var enabledKinds: [ResourceKind] {
-        ResourceKind.allCases.filter { isEnabled($0) }
+        order.filter { isEnabled($0) }   // the user's sidebar order, not declaration order
     }
 
     private static var disabledRawValues: [String] {

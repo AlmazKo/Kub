@@ -3,8 +3,9 @@ import AppKit
 enum ConfirmResult { case cancelled; case confirmed(Int?) }
 
 /// A lightweight popover that replaces system alerts for confirmations: a
-/// title, an aligned detail grid, an optional colored warning, a note, and an
-/// optional integer stepper (replicas / duration). Anchored to the triggering
+/// title, an aligned detail grid, an optional colored warning, a note, an
+/// optional integer stepper (replicas / duration), a live preview of the exact
+/// command, and an optional type-the-name gate (PVC/PV deletes). Anchored to the triggering
 /// row or view; transient (clicking away cancels). Async result via `onResult`.
 @MainActor
 final class ConfirmPopover: NSViewController, NSPopoverDelegate, NSTextFieldDelegate {
@@ -21,7 +22,7 @@ final class ConfirmPopover: NSViewController, NSPopoverDelegate, NSTextFieldDele
     private var stepperControl: StepperControl?
     private var contentView: NSView!
     private var finished = false
-    /// Builds the exact command to run from the current stepper value (nil = no stepper).
+    /// Builds the exact command to run from the current stepper value (the arg is nil when there's no stepper).
     private var commandBuilder: ((Int?) -> String)?
     private var commandLabel: NSTextField?
     /// Type-to-confirm gate for data-loss deletes: the confirm button stays disabled

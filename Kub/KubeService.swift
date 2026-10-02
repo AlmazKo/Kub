@@ -6,7 +6,8 @@ protocol KubeService: Sendable {
     func contexts() async throws -> (contexts: [ClusterContext], current: String?)
     /// All resources of `kind` across every namespace of the context.
     func resources(kind: ResourceKind, context: String) async throws -> [ResourceRow]
-    /// Lightweight element count for `kind` (names only — for sidebar counters).
+    /// Element count of `kind` for the sidebar: `get --raw <apiPath>?limit=1` +
+    /// `metadata.remainingItemCount`, with `-o name` only as the fallback.
     func count(kind: ResourceKind, context: String) async throws -> Int
     /// Identities (metadata.name) of all events — for the sidebar "unread" badge.
     func eventKeys(context: String) async throws -> Set<String>
@@ -20,14 +21,16 @@ protocol KubeService: Sendable {
 
     // Detail panel (return human-readable text straight from kubectl).
     func describe(kind: ResourceKind, context: String, namespace: String, name: String) async throws -> String
-    func logs(context: String, namespace: String, name: String) async throws -> String
     /// Follow a pod's logs (`logs -f`). Lines arrive via `onLine` (off-main); the
     /// stream ends with `onEnd` (nil = clean/stopped). Returns a stoppable handle.
-    func streamLogs(context: String, namespace: String, pod: String, container: String?,
+    /// `prefix` tags each line with its container (`[pod/<pod>/<container>]`) — only
+    /// worth it when the pod has more than one, or the lines are indistinguishable.
+    func streamLogs(context: String, namespace: String, pod: String, container: String?, prefix: Bool,
                     onLine: @escaping @Sendable (String) -> Void,
                     onEnd: @escaping @Sendable (KubectlError?) -> Void) -> KubectlProcess
-    func events(context: String, namespace: String, name: String) async throws -> String
-    func resourceEvents(context: String, namespace: String, name: String) async throws -> [ResourceRow]
+    /// Events of one object. `kind` is part of the selector: a Deployment, its Service
+    /// and its HPA usually share a name, and `involvedObject.name` alone mixes them.
+    func resourceEvents(kind: ResourceKind, context: String, namespace: String, name: String) async throws -> [ResourceRow]
     /// Long-lived `kubectl port-forward <resource>/<name> local:remote`. Status
     /// lines arrive via `onLine`; `onEnd` fires when it stops (nil = clean/stopped).
     func portForward(context: String, namespace: String, resource: String, name: String,
@@ -35,32 +38,49 @@ protocol KubeService: Sendable {
                      onLine: @escaping @Sendable (String) -> Void,
                      onEnd: @escaping @Sendable (KubectlError?) -> Void) -> KubectlProcess
     func topPod(context: String, namespace: String, name: String) async throws -> String
-    func podProcesses(context: String, namespace: String, name: String) async throws -> String
+    /// In-container process list. `container` nil = kubectl's default (the first one, or
+    /// the `kubectl.kubernetes.io/default-container` annotation).
+    func podProcesses(context: String, namespace: String, name: String, container: String?) async throws -> String
     /// Full pod JSON (for the "Why" health/forensics report).
     func podDetail(context: String, namespace: String, name: String) async throws -> K8sPod
     /// Scrape a pod's Prometheus `/metrics` (raw text). Uses an ephemeral
     /// `port-forward` + local HTTP GET (the kubelet streaming path), which reaches
     /// pods on managed clusters where the API-server pod proxy can't.
     func podMetrics(context: String, namespace: String, pod: String, endpoint: MetricEndpoint) async throws -> String
-    /// Prometheus-Operator monitors + Services in a namespace (for authoritative
-    /// metrics-endpoint discovery). Best-effort — empty when the CRDs are absent.
+    /// Prometheus-Operator monitors (cluster-wide, filtered later by their
+    /// `namespaceSelector`) + the Services of `namespace`, for authoritative
+    /// metrics-endpoint discovery. Best-effort — empty when the CRDs are absent.
     func metricsSources(context: String, namespace: String) async -> MetricsSources
 
     // Node detail (cluster-scoped — no namespace).
     func describeNode(context: String, name: String) async throws -> String
     func podsOnNode(context: String, node: String) async throws -> [ResourceRow]
     /// Map of node name → CPU architecture (amd64 / arm64 / …), so pods can show
-    /// the arch of the node they run on. Cheap `get nodes -o json` projection.
+    /// the arch of the node they run on. `get nodes -o json`, reduced client-side
+    /// to name → arch (60s-TTL cached by the view model).
     func nodeArchitectures(context: String) async throws -> [String: String]
     func describeNamespace(context: String, name: String) async throws -> String
     /// All resource entities in a namespace (kind / name / age).
     func namespaceInventory(context: String, namespace: String) async throws -> [NamespaceResource]
 
     // Diagnostics (heap dump / async-profiler). `args` is the in-container command
-    // after `--`; long ops pass a generous timeout.
-    func exec(context: String, namespace: String, pod: String, args: [String], timeoutSeconds: Int) async throws -> String
-    func copyFromPod(context: String, namespace: String, pod: String, remotePath: String, localPath: String) async throws
-    func copyToPod(context: String, namespace: String, pod: String, localPath: String, remotePath: String) async throws
+    // after `--`; long ops pass a generous timeout. `container` must be the one whose
+    // process list the PID came from — a sidecar pod has several PID namespaces.
+    func exec(context: String, namespace: String, pod: String, container: String?, args: [String], timeoutSeconds: Int) async throws -> String
+    func copyFromPod(context: String, namespace: String, pod: String, container: String?, remotePath: String, localPath: String) async throws
+    func copyToPod(context: String, namespace: String, pod: String, container: String?, localPath: String, remotePath: String) async throws
+}
+
+/// The page shape of `get --raw <list>?limit=1`: only the list metadata matters.
+private struct ListPage: Decodable {
+    struct Meta: Decodable {
+        let remainingItemCount: Int?
+        let `continue`: String?
+    }
+    private struct Ignored: Decodable { init(from decoder: Decoder) throws {} }
+    let metadata: Meta?
+    private let items: [Ignored]?
+    var itemCount: Int { items?.count ?? 0 }
 }
 
 struct KubectlClient: KubeService {
@@ -95,6 +115,7 @@ struct KubectlClient: KubeService {
 
     func resources(kind: ResourceKind, context: String) async throws -> [ResourceRow] {
         if kind == .nodes { return try await nodeRows(context: context) }
+        if kind == .secrets { return try await secretRows(context: context) }
         let nsFlag = kind.isNamespaced ? ["-A"] : []   // -A is invalid for cluster-scoped kinds
         let data = try await kubectl.run(
             ["--context", context, "get", kind.kubectlResource] + nsFlag + ["-o", "json", Self.readTimeout],
@@ -113,7 +134,7 @@ struct KubectlClient: KubeService {
         case .configMaps:
             return try decoder.decode(K8sList<K8sConfigMap>.self, from: data).items.map(Derive.configMap)
         case .secrets:
-            return try decoder.decode(K8sList<K8sSecret>.self, from: data).items.map(Derive.secret)
+            return []   // handled by secretRows above
         case .services:
             return try decoder.decode(K8sList<K8sService>.self, from: data).items.map(Derive.service)
         case .ingresses:
@@ -145,6 +166,55 @@ struct KubectlClient: KubeService {
         case .nodes:
             return []   // handled by nodeRows above
         }
+    }
+
+    /// Secrets are read as a server-side Table (`get secrets --no-headers`): the API
+    /// server answers with the printed cells plus PartialObjectMetadata and kubectl
+    /// prints only the cells, so secret VALUES never reach this process — `-o json`
+    /// would download every one of them just to count keys. (The metadata can still
+    /// carry a `last-applied-configuration` annotation with values into kubectl's own
+    /// memory; it never reaches stdout.) Columns: [NAMESPACE] NAME TYPE DATA AGE.
+    /// `namespace` nil = all namespaces.
+    private func secretRows(context: String, namespace: String? = nil) async throws -> [ResourceRow] {
+        // `-A` is a flag of `get`, not a global one — it must follow the verb.
+        let scope = namespace.map { ["-n", $0] } ?? ["-A"]
+        let data = try await kubectl.run(
+            ["--context", context, "get", "secrets"] + scope + ["--no-headers", Self.readTimeout],
+            highPriority: true)
+        let offset = namespace == nil ? 1 : 0
+        return String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { line -> ResourceRow? in
+                let f = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                guard f.count >= 4 + offset, let keys = Int(f[2 + offset]) else { return nil }
+                return ResourceRow(
+                    kind: .secrets, namespace: namespace ?? f[0], name: f[offset],
+                    statusText: "", statusKind: .neutral,
+                    // The Table carries kubectl's humanized age, not creationTimestamp —
+                    // good enough for the column and (approximately) for sorting.
+                    cells: ["type": f[1 + offset], "keys": f[2 + offset], "age": f[3 + offset], "created": "—"],
+                    sortValues: ["keys": Double(keys), "age": Self.humanizedSeconds(f[3 + offset])])
+            }
+    }
+
+    /// Seconds in a kubectl humanized duration (`2y5d`, `13d`, `36h`, `5m30s`, `45s`).
+    /// Approximate by construction; unknown text → 0.
+    static func humanizedSeconds(_ text: String) -> Double {
+        var total = 0.0, number = 0.0, sawDigit = false
+        for ch in text {
+            if let d = ch.wholeNumberValue { number = number * 10 + Double(d); sawDigit = true; continue }
+            guard sawDigit else { continue }
+            switch ch {
+            case "y": total += number * 365 * 86400
+            case "d": total += number * 86400
+            case "h": total += number * 3600
+            case "m": total += number * 60
+            case "s": total += number
+            default: break
+            }
+            number = 0; sawDigit = false
+        }
+        return total
     }
 
     /// `get nodes -o json` (status/age) merged with best-effort `top nodes` (usage).
@@ -179,10 +249,21 @@ struct KubectlClient: KubeService {
     }
 
     func count(kind: ResourceKind, context: String) async throws -> Int {
-        let nsFlag = kind.isNamespaced ? ["-A"] : []   // -A is invalid for cluster-scoped kinds
+        // `?limit=1` makes the API server answer one item plus `metadata.remainingItemCount`
+        // (a consistent read from etcd), so a sidebar count costs ~2KB instead of every
+        // object serialized — on a 300-pod cluster `-o name` still pulled 6MB per kind.
+        // An answer served from the watch cache omits the field but keeps a continue
+        // token; only then fall back to listing names.
         let data = try await kubectl.run(
+            ["--context", context, "get", "--raw", "\(kind.apiPath)?limit=1", Self.readTimeout])
+        if let page = try? decoder.decode(ListPage.self, from: data) {
+            if let remaining = page.metadata?.remainingItemCount { return page.itemCount + remaining }
+            if (page.metadata?.continue ?? "").isEmpty { return page.itemCount }   // the whole list fit in one page
+        }
+        let nsFlag = kind.isNamespaced ? ["-A"] : []   // -A is invalid for cluster-scoped kinds
+        let names = try await kubectl.run(
             ["--context", context, "get", kind.kubectlResource] + nsFlag + ["-o", "name", Self.readTimeout])
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: names, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
             .filter { !$0.isEmpty }
             .count
@@ -240,21 +321,17 @@ struct KubectlClient: KubeService {
         return String(decoding: data, as: UTF8.self)
     }
 
-    func logs(context: String, namespace: String, name: String) async throws -> String {
-        let data = try await kubectl.run(
-            ["--context", context, "-n", namespace, "logs", name,
-             "--tail=1000", "--all-containers=true", "--timestamps",
-             "--request-timeout=20s"],
-            highPriority: true)
-        return String(decoding: data, as: UTF8.self)
-    }
+    // `--all-containers` opens one log request per container and kubectl refuses the
+    // pod outright above its default of 5 — a pod with a few sidecars has more.
+    private static let maxLogRequests = "--max-log-requests=50"
 
-    func streamLogs(context: String, namespace: String, pod: String, container: String?,
+    func streamLogs(context: String, namespace: String, pod: String, container: String?, prefix: Bool,
                     onLine: @escaping @Sendable (String) -> Void,
                     onEnd: @escaping @Sendable (KubectlError?) -> Void) -> KubectlProcess {
         var args = ["--context", context, "-n", namespace, "logs", pod,
                     "-f", "--tail=2000", "--timestamps"]
-        if let container { args += ["-c", container] } else { args.append("--all-containers=true") }
+        if let container { args += ["-c", container] } else { args += ["--all-containers=true", Self.maxLogRequests] }
+        if prefix && container == nil { args.append("--prefix") }
         return kubectl.stream(args, onLine: onLine, onEnd: onEnd)
     }
 
@@ -302,34 +379,34 @@ struct KubectlClient: KubeService {
     }
 
     func metricsSources(context: String, namespace: String) async -> MetricsSources {
-        async let sm = optionalList(K8sServiceMonitor.self, context: context, namespace: namespace, resource: "servicemonitors")
-        async let pm = optionalList(K8sPodMonitor.self, context: context, namespace: namespace, resource: "podmonitors")
+        // Monitors are listed cluster-wide: the common kube-prometheus layout keeps them
+        // in `monitoring` with a `namespaceSelector` — the pod's namespace is only one of
+        // the places they live. Discovery filters them by that selector. Services stay
+        // namespace-local (a ServiceMonitor can only pick Services in the selected namespaces).
+        async let sm = optionalList(K8sServiceMonitor.self, context: context, namespace: nil, resource: "servicemonitors")
+        async let pm = optionalList(K8sPodMonitor.self, context: context, namespace: nil, resource: "podmonitors")
         async let svc = optionalList(K8sService.self, context: context, namespace: namespace, resource: "services")
         return await MetricsSources(serviceMonitors: sm, podMonitors: pm, services: svc)
     }
 
-    /// `get <resource> -n <ns> -o json` decoded to `[T]`, swallowing all errors
+    /// `get <resource> [-n <ns> | -A] -o json` decoded to `[T]`, swallowing all errors
     /// (missing CRD / no RBAC) → empty. For best-effort discovery inputs.
-    private func optionalList<T: Decodable & Sendable>(_ type: T.Type, context: String, namespace: String, resource: String) async -> [T] {
+    private func optionalList<T: Decodable & Sendable>(_ type: T.Type, context: String, namespace: String?, resource: String) async -> [T] {
+        let scope = namespace.map { ["-n", $0] } ?? ["-A"]   // after the verb: `-A` is a `get` flag
         guard let data = try? await kubectl.run(
-            ["--context", context, "-n", namespace, "get", resource, "-o", "json", Self.readTimeout],
+            ["--context", context, "get", resource] + scope + ["-o", "json", Self.readTimeout],
             highPriority: true) else { return [] }   // feeds the Metrics tab the user opened
-        return (try? JSONDecoder().decode(K8sList<T>.self, from: data))?.items ?? []
+        return (try? decoder.decode(K8sList<T>.self, from: data))?.items ?? []
     }
 
-    func events(context: String, namespace: String, name: String) async throws -> String {
-        let data = try await kubectl.run(
-            ["--context", context, "-n", namespace, "get", "events",
-             "--field-selector", "involvedObject.name=\(name)",
-             "--sort-by=.lastTimestamp", Self.readTimeout],
-            highPriority: true)
-        return String(decoding: data, as: UTF8.self)
+    private static func eventSelector(kind: ResourceKind, name: String) -> String {
+        "involvedObject.name=\(name),involvedObject.kind=\(kind.apiKind)"
     }
 
-    func resourceEvents(context: String, namespace: String, name: String) async throws -> [ResourceRow] {
+    func resourceEvents(kind: ResourceKind, context: String, namespace: String, name: String) async throws -> [ResourceRow] {
         let data = try await kubectl.run(
             ["--context", context, "-n", namespace, "get", "events",
-             "--field-selector", "involvedObject.name=\(name)", "-o", "json", Self.readTimeout],
+             "--field-selector", Self.eventSelector(kind: kind, name: name), "-o", "json", Self.readTimeout],
             highPriority: true)
         return try decoder.decode(K8sList<K8sEvent>.self, from: data).items.map(Derive.event)
     }
@@ -364,56 +441,73 @@ struct KubectlClient: KubeService {
     }
 
     func namespaceInventory(context: String, namespace: String) async throws -> [NamespaceResource] {
-        // One query for many kinds; each item carries its own `kind`.
+        // One JSON query for many kinds (each item carries its own `kind`), plus the
+        // secrets as a Table so their values never reach this process. Secrets are
+        // best-effort: RBAC often allows listing pods but not secrets.
+        async let secretsTask = try? secretRows(context: context, namespace: namespace)
         let data = try await kubectl.run(
             ["--context", context, "-n", namespace, "get", NamespaceInventory.query, "-o", "json", Self.readTimeout],
             highPriority: true)
-        return try decoder.decode(K8sList<K8sObject>.self, from: data).items.map { obj in
-            NamespaceResource(
+        var items = try decoder.decode(K8sList<K8sObject>.self, from: data).items.map { obj in
+            let age = Age.stamp(obj.metadata.creationTimestamp)
+            return NamespaceResource(
                 kind: obj.kind.flatMap { NamespaceInventory.kindByApiKind[$0] },
                 kindLabel: obj.kind ?? "?",
                 name: obj.metadata.name,
-                age: Age.format(obj.metadata.creationTimestamp),
-                ageSeconds: Age.seconds(obj.metadata.creationTimestamp))
+                age: age.text,
+                ageSeconds: age.seconds)
         }
+        for row in await secretsTask ?? [] {
+            items.append(NamespaceResource(kind: .secrets, kindLabel: "Secret", name: row.name,
+                                           age: row.value("age"), ageSeconds: row.sortValues["age"] ?? 0))
+        }
+        return items
     }
 
-    func podProcesses(context: String, namespace: String, name: String) async throws -> String {
-        // Read-only process listing inside the container; falls back across busybox/procps.
-        // readTimeout bounds connection setup (before "--", so it's a kubectl flag, not
-        // a shell arg) — without it a slow/hung exec holds a gate slot indefinitely.
-        let script = "top -bn1 2>/dev/null || ps aux 2>/dev/null || ps -ef 2>/dev/null || echo 'no top/ps in container'"
+    private static func containerFlag(_ container: String?) -> [String] {
+        container.map { ["-c", $0] } ?? []
+    }
+
+    func podProcesses(context: String, namespace: String, name: String, container: String?) async throws -> String {
+        // Read-only process listing inside the container; falls back across procps/busybox.
+        // procps `top` needs `-w` (else it truncates rows at 80 columns without a tty) and
+        // `-c` (full command lines); busybox rejects `-w` and takes the plain form.
+        // NOTE: `--request-timeout` does NOT bound an exec session (verified: a 3s timeout
+        // let `sleep 7` finish) — `Kubectl.run`'s 30s `timeout:` watchdog is what frees
+        // the slot if the exec hangs.
+        let script = "top -bn1 -w512 -c 2>/dev/null || top -bn1 2>/dev/null || ps aux 2>/dev/null || ps -ef 2>/dev/null || echo 'no top/ps in container'"
         let data = try await kubectl.run(
-            ["--context", context, "-n", namespace, Self.readTimeout, "exec", name, "--",
+            ["--context", context, "-n", namespace, "exec", name] + Self.containerFlag(container) + ["--",
              "/bin/sh", "-c", script],
             highPriority: true)
         return String(decoding: data, as: UTF8.self)
     }
 
-    // Long diagnostics run on `diag` (separate gate). cp is bounded by a generous
-    // request-timeout and finite retries so a stalled transfer can't wedge a slot.
-    private static let copyTimeout = "--request-timeout=1200s"
+    // Long diagnostics run on `diag` (separate gate). `--request-timeout` does not cap a
+    // streaming exec/cp session, so each call's `timeout:` (the SIGTERM/SIGKILL watchdog
+    // in `Kubectl.run`) is the real bound; `--retries` keeps a flaky cp finite.
     private static let copyRetries = "--retries=3"
+    private static let copyWatchdog: TimeInterval = 1260
 
-    func exec(context: String, namespace: String, pod: String, args: [String], timeoutSeconds: Int) async throws -> String {
-        // request-timeout before "exec" so it's parsed by kubectl; long ops (profiling,
-        // big heap dumps) need a generous bound rather than the 15s read timeout.
+    func exec(context: String, namespace: String, pod: String, container: String?, args: [String], timeoutSeconds: Int) async throws -> String {
         let data = try await diag.run(
-            ["--context", context, "-n", namespace, "--request-timeout=\(timeoutSeconds)s", "exec", pod, "--"] + args,
-            timeout: TimeInterval(timeoutSeconds) + 60)   // watchdog: past the request-timeout
+            ["--context", context, "-n", namespace, "exec", pod] + Self.containerFlag(container) + ["--"] + args,
+            timeout: TimeInterval(timeoutSeconds) + 60)   // watchdog: the op's own budget + margin
         return String(decoding: data, as: UTF8.self)
     }
 
-    func copyFromPod(context: String, namespace: String, pod: String, remotePath: String, localPath: String) async throws {
+    func copyFromPod(context: String, namespace: String, pod: String, container: String?, remotePath: String, localPath: String) async throws {
         _ = try await diag.run(
-            ["--context", context, Self.copyTimeout, "cp", Self.copyRetries, "\(namespace)/\(pod):\(remotePath)", localPath],
-            timeout: 1260)   // matches copyTimeout (1200s) + margin
+            ["--context", context, "cp", Self.copyRetries] + Self.containerFlag(container)
+                + ["\(namespace)/\(pod):\(remotePath)", localPath],
+            timeout: Self.copyWatchdog)
     }
 
-    func copyToPod(context: String, namespace: String, pod: String, localPath: String, remotePath: String) async throws {
+    func copyToPod(context: String, namespace: String, pod: String, container: String?, localPath: String, remotePath: String) async throws {
         _ = try await diag.run(
-            ["--context", context, Self.copyTimeout, "cp", Self.copyRetries, localPath, "\(namespace)/\(pod):\(remotePath)"],
-            timeout: 1260)
+            ["--context", context, "cp", Self.copyRetries] + Self.containerFlag(container)
+                + [localPath, "\(namespace)/\(pod):\(remotePath)"],
+            timeout: Self.copyWatchdog)
     }
 
     // MARK: - Context heuristics

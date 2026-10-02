@@ -174,7 +174,7 @@ final class TopReportView: NSView {
 
     /// Best-effort numeric value for sorting. Handles clock durations
     /// ("10:05", "1:23.45" TIME+, "01:23:45"), percentages, binary `i`, and
-    /// k/m/g/t scale suffixes. nil for non-numeric cells (STAT, COMMAND) → those
+    /// binary k/m/g/t scale suffixes (top's K is KiB). nil for non-numeric cells (STAT, COMMAND) → those
     /// fall back to string compare.
     static func numeric(_ raw: String) -> Double? {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
@@ -199,10 +199,10 @@ final class TopReportView: NSView {
         var mult = 1.0
         if let last = s.last, last.isLetter {
             switch Character(last.lowercased()) {
-            case "k": mult = 1e3
-            case "m": mult = 1e6
-            case "g": mult = 1e9
-            case "t": mult = 1e12
+            case "k": mult = 1024
+            case "m": mult = 1048576
+            case "g": mult = 1073741824
+            case "t": mult = 1099511627776
             default: return nil
             }
             s.removeLast()

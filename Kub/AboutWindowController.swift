@@ -40,7 +40,8 @@ final class AboutWindowController: NSWindowController {
         title.font = roundedFont(size: 46, weight: .bold)
         title.textColor = .white
 
-        let slogan = NSTextField(labelWithString: "The bare necessities of Kubernetes.")
+        // "bear", not a typo: Baloo's "Bare Necessities" + the cub (Kub = K8s + cub).
+        let slogan = NSTextField(labelWithString: "The bear necessities of Kubernetes.")
         slogan.font = .systemFont(ofSize: 13, weight: .medium)
         slogan.textColor = NSColor.white.withAlphaComponent(0.85)
 

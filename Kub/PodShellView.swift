@@ -12,6 +12,7 @@ final class PodShellView: NSView, LocalProcessTerminalViewDelegate {
     private let connectButton = NSButton()
 
     private var context = "", namespace = "", pod = ""
+    private var container: String?          // nil → kubectl's default container
     private var isProduction = false
     private(set) var running = false
 
@@ -101,11 +102,13 @@ final class PodShellView: NSView, LocalProcessTerminalViewDelegate {
     ]
 
     /// Point the view at a pod. Idempotent for the same pod (keeps a live session);
-    /// switching pods drops the old one and shows the connect overlay.
-    func configure(context: String, namespace: String, pod: String, isProduction: Bool) {
+    /// switching pods drops the old one and shows the connect overlay. `container`
+    /// is the app container (see `PodContainers.main`); nil leaves it to kubectl.
+    func configure(context: String, namespace: String, pod: String, container: String?, isProduction: Bool) {
         if running, (context, namespace, pod) != (self.context, self.namespace, self.pod) { stop() }
         self.context = context; self.namespace = namespace; self.pod = pod; self.isProduction = isProduction
-        if !running { showOverlay(title: "Shell into “\(pod)”") }
+        if !running { self.container = container }   // a live session keeps the container it opened with
+        if !running { showOverlay(title: container.map { "Shell into “\(pod)” (\($0))" } ?? "Shell into “\(pod)”") }
     }
 
     @objc private func connectTapped() { start() }
@@ -122,8 +125,8 @@ final class PodShellView: NSView, LocalProcessTerminalViewDelegate {
         // `exec` terminates the shell (127) before the fallback runs, so probe with
         // `command -v` first. Prefers bash, then ash (Alpine), then plain sh.
         let pickShell = "for s in bash ash sh; do command -v \"$s\" >/dev/null 2>&1 && exec \"$s\"; done"
-        let args = kube.prefix + ["--context", context, "-n", namespace, "exec", "-it", pod, "--",
-                                  "sh", "-c", pickShell]
+        let args = kube.prefix + ["--context", context, "-n", namespace, "exec", "-it", pod]
+            + (container.map { ["-c", $0] } ?? []) + ["--", "sh", "-c", pickShell]
         terminal.startProcess(executable: kube.path, args: args,
                               environment: env.map { "\($0.key)=\($0.value)" })
         running = true
@@ -138,13 +141,14 @@ final class PodShellView: NSView, LocalProcessTerminalViewDelegate {
         running = false
     }
 
-    private func showOverlay(title: String) {
+    /// `ended` = a session just finished, so the button offers to reconnect.
+    private func showOverlay(title: String, ended: Bool = false) {
         overlayTitle.stringValue = title
         warningLabel.isHidden = !isProduction
         warningLabel.stringValue = isProduction
             ? "⚠︎ Production context — this opens an interactive shell into a live pod."
             : ""
-        connectButton.title = running ? "Reconnect" : "Start shell"
+        connectButton.title = ended ? "Reconnect" : "Start Shell"
         overlay.isHidden = false
     }
 
@@ -155,7 +159,7 @@ final class PodShellView: NSView, LocalProcessTerminalViewDelegate {
         Task { @MainActor in
             self.running = false
             self.showOverlay(title: exitCode.map { "Session ended (exit \($0)) — “\(self.pod)”" }
-                                    ?? "Session ended — “\(self.pod)”")
+                                    ?? "Session ended — “\(self.pod)”", ended: true)
         }
     }
     nonisolated func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}

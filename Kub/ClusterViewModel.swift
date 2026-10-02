@@ -97,6 +97,37 @@ final class ClusterViewModel {
         }
     }
 
+    /// Main-container resolution per pod (`PodContainers.main`), cached so the ~3s Top
+    /// poll and each diagnostic step don't re-fetch the pod spec. Keyed context|ns|pod.
+    private var mainContainerCache: [String: (name: String?, at: Date)] = [:]
+
+    /// The cached app-container name for a pod of the selected context, if resolved
+    /// recently; nil = unknown (or genuinely none) → let kubectl pick its default.
+    func cachedMainContainer(namespace: String, pod: String) -> String? {
+        guard let ctx = selectedContext, let e = mainContainerCache["\(ctx)|\(namespace)|\(pod)"],
+              Date().timeIntervalSince(e.at) < cacheTTL else { return nil }
+        return e.name
+    }
+
+    /// Resolve (and cache) the container that process-level actions target. nil when
+    /// the pod can't be read — the caller then leaves the choice to kubectl.
+    func mainContainer(namespace: String, pod: String) async -> String? {
+        guard let ctx = selectedContext else { return nil }
+        if let cached = cachedMainContainer(namespace: namespace, pod: pod) { return cached }
+        guard let detail = try? await service.podDetail(context: ctx, namespace: namespace, name: pod) else { return nil }
+        let name = PodContainers.main(of: detail)
+        mainContainerCache["\(ctx)|\(namespace)|\(pod)"] = (name, Date())
+        return name
+    }
+
+    /// CPU architecture of the node a pod runs on, from the already-joined pod rows
+    /// (nil when unknown). Picks the async-profiler build to upload.
+    private func podArch(namespace: String, pod: String) -> String? {
+        guard let ctx = selectedContext else { return nil }
+        let arch = rowCache[ctx]?[.pods]?.rows.first { $0.namespace == namespace && $0.name == pod }?.cells["arch"] ?? ""
+        return arch.isEmpty ? nil : arch
+    }
+
     // Synchronous cache reads for the detail pane (show instantly, then refresh).
     func cachedDetailText(for row: ResourceRow, section: DetailSection) -> String? {
         cachedDetail(detailKey(selectedContext ?? "", row, "text.\(section.rawValue)"))
@@ -197,7 +228,7 @@ final class ClusterViewModel {
     func refreshResources(showSpinner: Bool) async {
         guard let ctx = selectedContext else { return }
         let kind = selectedKind
-        let cmd = beginCommand(kubectlDisplay("get \(kind.kubectlResource) -A -o json"))
+        let cmd = beginCommand(kubectlDisplay(Self.listCommand(kind)))
         if showSpinner { beginActivity("Loading \(kind.displayName.lowercased())…") }
         defer { if showSpinner { endActivity() }; endCommand(cmd) }
         do {
@@ -257,7 +288,7 @@ final class ClusterViewModel {
     private func loadCount(for kind: ResourceKind, context ctx: String) async {
         // Events show an "unread" badge, not a total — needs fresh identities, not a cached count.
         if kind == .events { await loadEventUnread(context: ctx); return }
-        // Reuse fresh full data if we already have it — no extra `-o name` query.
+        // Reuse fresh full data if we already have it — no extra count query.
         if let cached = cachedRows(ctx, kind) {
             countCache[ctx, default: [:]][kind] = cached.count
             if selectedContext == ctx {
@@ -266,7 +297,7 @@ final class ClusterViewModel {
             }
             return
         }
-        let cmd = beginCommand(kubectlDisplay("get \(kind.kubectlResource) -A -o name"))
+        let cmd = beginCommand(kubectlDisplay("get --raw \(kind.apiPath)?limit=1"))
         defer { endCommand(cmd) }
         do {
             let n = try await service.count(kind: kind, context: ctx)
@@ -355,7 +386,7 @@ final class ClusterViewModel {
         let res = row.kind.kubectlResource
         let nsFlag = row.namespace.isEmpty ? "" : " -n \(row.namespace)"   // cluster-scoped kinds (PV) have none
         let command = action == .delete
-            ? kubectlDisplay("delete \(res) \(row.name)\(nsFlag)")
+            ? kubectlDisplay("delete \(res) \(row.name)\(nsFlag) --wait=false")
             : kubectlDisplay("rollout restart \(res)/\(row.name)\(nsFlag)")
         Task {
             let cmd = beginCommand(command)
@@ -400,8 +431,11 @@ final class ClusterViewModel {
                     onLine: @escaping @Sendable (String) -> Void,
                     onEnd: @escaping @Sendable (KubectlError?) -> Void) -> KubectlProcess? {
         guard let ctx = selectedContext, row.kind == .pods else { return nil }
+        // The READY cell's total ("1/2") counts app containers + native sidecars —
+        // exactly the ones `--all-containers` streams.
+        let containers = Int(row.value("ready").split(separator: "/").last ?? "") ?? 1
         return service.streamLogs(context: ctx, namespace: row.namespace, pod: row.name,
-                                  container: nil, onLine: onLine, onEnd: onEnd)
+                                  container: nil, prefix: containers > 1, onLine: onLine, onEnd: onEnd)
     }
 
     /// Start a `kubectl port-forward`. Returns a stoppable handle (nil if no context).
@@ -489,39 +523,13 @@ final class ClusterViewModel {
         if section == .logs && row.kind != .pods {
             return "Logs are available for pods."
         }
-        if section == .top || section == .metrics {
-            return ""   // rendered via detailTop(for:) / podMetrics(for:); not through reloadDetail's text path.
-        }
-        let tail: String
-        switch section {
-        case .overview: tail = "describe \(row.kind.singularName) \(row.name) -n \(row.namespace)"
-        case .logs: tail = "logs \(row.name) -n \(row.namespace) --tail=1000 --all-containers"
-        case .events: tail = "get events -n \(row.namespace) --field-selector involvedObject.name=\(row.name)"
-        case .top, .pods, .resources, .health, .containers, .mounts, .history, .metrics, .shell: tail = ""   // handled above
-        }
-        let cmd = beginCommand(kubectlDisplay(tail))
+        // Only Overview is text from here on. Pod logs stream (LiveLogView), Events is
+        // the native table (resourceEvents), Top/Metrics/Shell have their own views.
+        guard section == .overview else { return "" }
+        let cmd = beginCommand(kubectlDisplay("describe \(row.kind.singularName) \(row.name)\(row.namespace.isEmpty ? "" : " -n \(row.namespace)")"))
         defer { endCommand(cmd) }
-        let text: String
-        switch section {
-        case .overview:
-            text = try await service.describe(kind: row.kind, context: ctx, namespace: row.namespace, name: row.name)
-        case .logs:
-            text = try await service.logs(context: ctx, namespace: row.namespace, name: row.name)
-        case .events:
-            text = try await service.events(context: ctx, namespace: row.namespace, name: row.name)
-        case .top, .pods, .resources, .health, .containers, .mounts, .history, .metrics, .shell:
-            text = ""   // handled above
-        }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            switch section {
-            case .logs: return "(no logs)"
-            case .events: return "No recent events."
-            case .overview: return "(no output)"
-            case .top, .pods, .resources, .health, .containers, .mounts, .history, .metrics, .shell: return ""
-            }
-        }
-        return text
+        let text = try await service.describe(kind: row.kind, context: ctx, namespace: row.namespace, name: row.name)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(no output)" : text
     }
 
     /// `kubectl top pod --containers` (resource usage) + an in-container process
@@ -532,8 +540,13 @@ final class ClusterViewModel {
         let cmd = beginCommand(kubectlDisplay("top pod \(row.name) -n \(row.namespace) --containers"))
         defer { endCommand(cmd) }
 
+        // The process list (and any PID the user acts on from it) is per container —
+        // pin it to the app container rather than kubectl's first-listed one.
+        let container = await mainContainer(namespace: row.namespace, pod: row.name)
+        let psCmd = beginCommand(kubectlDisplay("exec \(row.name) -n \(row.namespace)\(Self.containerFlag(container)) -- top -bn1"))
+        defer { endCommand(psCmd) }
         async let metricsResult = service.topPod(context: ctx, namespace: row.namespace, name: row.name)
-        async let procsResult = service.podProcesses(context: ctx, namespace: row.namespace, name: row.name)
+        async let procsResult = service.podProcesses(context: ctx, namespace: row.namespace, name: row.name, container: container)
 
         var report = PodTopReport()
         report.podNamespace = row.namespace
@@ -576,7 +589,7 @@ final class ClusterViewModel {
     /// All resource entities in a namespace, for the namespace detail table.
     func namespaceInventory(for row: ResourceRow) async throws -> [NamespaceResource] {
         guard let ctx = selectedContext else { return [] }
-        let cmd = beginCommand(kubectlDisplay("get <resources> -n \(row.name) -o name"))
+        let cmd = beginCommand(kubectlDisplay("get <resources> -n \(row.name) -o json (+ secrets --no-headers)"))
         defer { endCommand(cmd) }
         let items = try await service.namespaceInventory(context: ctx, namespace: row.name)
         storeDetail(detailKey(ctx, row, "inventory"), items)
@@ -596,16 +609,17 @@ final class ClusterViewModel {
     /// A single resource's Events as structured rows (for the native Events table).
     func resourceEvents(for row: ResourceRow) async throws -> [ResourceRow] {
         guard let ctx = selectedContext else { return [] }
-        let cmd = beginCommand(kubectlDisplay("get events -n \(row.namespace) --field-selector involvedObject.name=\(row.name)"))
+        let cmd = beginCommand(kubectlDisplay("get events -n \(row.namespace) --field-selector involvedObject.name=\(row.name),involvedObject.kind=\(row.kind.apiKind)"))
         defer { endCommand(cmd) }
-        let events = try await service.resourceEvents(context: ctx, namespace: row.namespace, name: row.name)
+        let events = try await service.resourceEvents(kind: row.kind, context: ctx, namespace: row.namespace, name: row.name)
         storeDetail(detailKey(ctx, row, "events"), events)
         return events
     }
 
     /// Scrape a pod's Prometheus `/metrics` into a parsed report for the Metrics
     /// tab. `override` supplies an explicit endpoint (from the tab's port/path
-    /// fields); otherwise it's discovered from the pod's annotations/ports.
+    /// fields); otherwise it's discovered (Service/PodMonitor → `prometheus.io` annotations
+    /// on the pod or its Service → named metrics port → guess).
     /// Expected failures (no port, scrape error) come back as a `note` — with the
     /// endpoint preserved so the user can fix the port/path and retry.
     func podMetrics(for row: ResourceRow, override: MetricEndpoint?) async throws -> MetricsReport {
@@ -616,7 +630,7 @@ final class ClusterViewModel {
         if let override {
             endpoint = override
         } else {
-            let cmd = beginCommand(kubectlDisplay("get pod \(row.name) -n \(row.namespace) -o json (+ ServiceMonitors)"))
+            let cmd = beginCommand(kubectlDisplay("get pod \(row.name) -n \(row.namespace) -o json (+ servicemonitors/podmonitors -A, services)"))
             // Fetch the pod and the operator monitors concurrently; monitors are
             // best-effort (empty without prometheus-operator) so they never throw.
             async let sourcesTask = service.metricsSources(context: ctx, namespace: row.namespace)
@@ -630,7 +644,7 @@ final class ClusterViewModel {
                 // Only a guess — pre-fill the port and let the user confirm with Load
                 // (scraping a wrong, non-HTTP port could stall the port-forward).
                 return MetricsReport(endpoint: guess.endpoint, document: MetricsDocument(),
-                    note: "No metrics port is declared on this pod. Guessed port \(guess.endpoint.port) from its container ports — press Load to scrape, or edit the port/path first.")
+                    note: "No metrics port is declared on this pod. Guessed port \(guess.endpoint.port) — press Load to scrape, or edit the port/path first.")
             }
             endpoint = guess.endpoint
         }
@@ -664,39 +678,65 @@ final class ClusterViewModel {
     /// Best-effort, fire-and-forget removal of diagnostic leftovers in the pod.
     /// Must run on failure paths too — a dead transfer would otherwise strand a
     /// multi-GB dump in the pod's /tmp (disk-pressure/eviction risk on prod).
-    private func cleanupRemote(context ctx: String, namespace ns: String, pod: String, paths: String) {
+    private func cleanupRemote(context ctx: String, namespace ns: String, pod: String, container: String?, paths: String) {
         let svc = service
-        Task { _ = try? await svc.exec(context: ctx, namespace: ns, pod: pod,
+        Task { _ = try? await svc.exec(context: ctx, namespace: ns, pod: pod, container: container,
                                        args: ["/bin/sh", "-lc", "rm -rf \(paths)"], timeoutSeconds: 60) }
     }
 
     /// `jcmd GC.heap_dump` on the given in-container PID, gzip, copy out, gunzip
-    /// locally. Returns the saved file URL.
+    /// locally. Returns the saved file URL. Every step names the same container the
+    /// PID was listed in (a sidecar pod has one PID namespace per container).
     func heapDump(namespace ns: String, name pod: String, pid: String) async throws -> URL {
-        guard let ctx = selectedContext else { throw KubectlError(message: "No context selected", code: 1) }
+        guard let ctx = selectedContext else { throw KubectlError(message: "No context selected.", code: -1) }
+        let container = await mainContainer(namespace: ns, pod: pod)
         let ts = diagTimestamp()
-        let remoteHprof = "/tmp/heap-\(ts).hprof", remoteGz = remoteHprof + ".gz"
+        let base = "heap-\(ts).hprof"
+        // Wherever the dump landed, these globs cover it (for cleanup on failure).
+        let leftovers = "/tmp/\(base)* /var/tmp/\(base)* \"${TMPDIR:-/nonexistent}\"/\(base)*"
 
-        // Locate jcmd next to the JVM's own binary (generic), with fallbacks.
+        // Locate jcmd next to the JVM's own binary (generic), with fallbacks; then pick
+        // a writable directory with room: the .hprof is about the live heap and gzip
+        // needs space for its output alongside, so require ~1.3× the JVM's RSS.
+        // Hardened pods often mount a read-only root fs — try the usual places in order.
+        // jcmd's chatter goes to stderr so stdout's last line is the finished .gz path.
         let script = """
         set -e
         PID=\(pid)
         JCMD=""
         EXE=$(readlink -f /proc/$PID/exe 2>/dev/null || true)
         if [ -n "$EXE" ] && [ -x "$(dirname "$EXE")/jcmd" ]; then JCMD="$(dirname "$EXE")/jcmd"; fi
+        if [ -z "$JCMD" ] && [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/jcmd" ]; then JCMD="$JAVA_HOME/bin/jcmd"; fi
         if [ -z "$JCMD" ]; then JCMD=$(command -v jcmd 2>/dev/null || true); fi
-        if [ -z "$JCMD" ] && [ -x /fx/bin/jcmd ]; then JCMD=/fx/bin/jcmd; fi
-        if [ -z "$JCMD" ]; then echo "jcmd not found for PID $PID" >&2; exit 3; fi
-        "$JCMD" $PID GC.heap_dump \(remoteHprof)
-        gzip -f \(remoteHprof)
-        ls -lh \(remoteGz)
+        if [ -z "$JCMD" ]; then echo "jcmd not found for PID $PID — a heap dump needs a JDK in the container (JRE-only image?)" >&2; exit 3; fi
+        RSS_KB=$(awk '/VmRSS/ {print $2}' /proc/$PID/status 2>/dev/null); RSS_KB=${RSS_KB:-0}
+        NEED_KB=$((RSS_KB * 13 / 10))
+        DIR=""
+        for d in "${TMPDIR:-}" /tmp /var/tmp "$PWD"; do
+          [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] || continue
+          FREE_KB=$(df -Pk "$d" 2>/dev/null | awk 'NR==2 {print $4}')
+          if [ -n "$FREE_KB" ] && [ "$FREE_KB" -gt "$NEED_KB" ]; then DIR="$d"; break; fi
+        done
+        if [ -z "$DIR" ]; then echo "no writable directory with ${NEED_KB}KB free for the heap dump (checked \\$TMPDIR, /tmp, /var/tmp, cwd)" >&2; exit 4; fi
+        OUT="$DIR/\(base)"
+        "$JCMD" $PID GC.heap_dump "$OUT" >&2
+        gzip -f "$OUT"
+        echo "$OUT.gz"
         """
-        let c1 = beginCommand(kubectlDisplay("exec \(pod) -- jcmd \(pid) GC.heap_dump"))
-        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod,
-                                        args: ["/bin/sh", "-lc", script], timeoutSeconds: 900) }
-        catch {
+        let target = "\(pod) -n \(ns)\(Self.containerFlag(container))"
+        let c1 = beginCommand(kubectlDisplay("exec \(target) -- jcmd \(pid) GC.heap_dump"))
+        let remoteGz: String
+        do {
+            let out = try await service.exec(context: ctx, namespace: ns, pod: pod, container: container,
+                                             args: ["/bin/sh", "-lc", script], timeoutSeconds: 900)
+            guard let last = out.split(whereSeparator: \.isNewline).last?.trimmingCharacters(in: .whitespaces),
+                  last.hasSuffix("\(base).gz") else {
+                throw KubectlError(message: "heap dump did not report its output file:\n\(out.suffix(300))", code: 1)
+            }
+            remoteGz = last
+        } catch {
             endCommand(c1)
-            cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: "\(remoteHprof) \(remoteGz)")
+            cleanupRemote(context: ctx, namespace: ns, pod: pod, container: container, paths: leftovers)
             throw error
         }
         endCommand(c1)
@@ -704,73 +744,81 @@ final class ClusterViewModel {
         let dir = DiagnosticPaths.dumpsDir(ns)
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let localGz = "\(dir)/\(ts).hprof.gz"
-        let c2 = beginCommand(kubectlDisplay("cp \(pod):\(remoteGz)"))
-        do { try await service.copyFromPod(context: ctx, namespace: ns, pod: pod,
+        let c2 = beginCommand(kubectlDisplay("cp\(Self.containerFlag(container)) \(ns)/\(pod):\(remoteGz) \(localGz)"))
+        do { try await service.copyFromPod(context: ctx, namespace: ns, pod: pod, container: container,
                                            remotePath: remoteGz, localPath: localGz) }
         catch {
             endCommand(c2)
-            cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: remoteGz)
+            cleanupRemote(context: ctx, namespace: ns, pod: pod, container: container, paths: remoteGz)
             throw error
         }
         endCommand(c2)
 
-        // Free the pod's /tmp; decompress the local copy.
-        cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: remoteGz)
+        // Free the pod's disk; decompress the local copy.
+        cleanupRemote(context: ctx, namespace: ns, pod: pod, container: container, paths: remoteGz)
         let localHprof = "\(dir)/\(ts).hprof"
         _ = try? await LocalProcess.run("/usr/bin/gunzip", ["-f", localGz])
         return URL(fileURLWithPath: FileManager.default.fileExists(atPath: localHprof) ? localHprof : localGz)
     }
 
-    /// Upload async-profiler, run `asprof` for `seconds`, copy the JFR out.
+    /// Upload async-profiler (the build matching the node's CPU architecture), run
+    /// `asprof` for `seconds`, copy the JFR out.
     func profile(namespace ns: String, name pod: String, pid: String, preset: AsyncProfile, seconds: Int) async throws -> URL {
-        guard let ctx = selectedContext else { throw KubectlError(message: "No context selected", code: 1) }
-        guard let tarURL = DiagnosticPaths.asyncProfilerTar,
-              FileManager.default.fileExists(atPath: tarURL.path) else {
-            throw KubectlError(message: "Bundled async-profiler (\(DiagnosticPaths.asyncProfilerDir).tar) not found in app Resources", code: 1)
+        guard let ctx = selectedContext else { throw KubectlError(message: "No context selected.", code: -1) }
+        let arch = podArch(namespace: ns, pod: pod)
+        guard let profilerDir = DiagnosticPaths.asyncProfilerDir(arch: arch) else {
+            throw KubectlError(message: "async-profiler has no build for node architecture “\(arch ?? "?")” (bundled: x64, arm64)", code: 1)
         }
+        guard let tarURL = DiagnosticPaths.asyncProfilerTar(arch: arch),
+              FileManager.default.fileExists(atPath: tarURL.path) else {
+            throw KubectlError(message: "Bundled async-profiler (\(profilerDir).tar) not found in app Resources", code: 1)
+        }
+        let container = await mainContainer(namespace: ns, pod: pod)
         let tarLocal = tarURL.path
         let ts = diagTimestamp()
         let work = "/tmp/aprof"
         let remoteTar = "\(work)/async-profiler.tar"
         let remoteOut = "\(work)/\(preset.rawValue)-\(ts).jfr"
-        let asprof = "\(work)/\(DiagnosticPaths.asyncProfilerDir)/bin/asprof"
+        let asprof = "\(work)/\(profilerDir)/bin/asprof"
+        func cleanup() { cleanupRemote(context: ctx, namespace: ns, pod: pod, container: container, paths: work) }
 
-        let cPrep = beginCommand(kubectlDisplay("exec \(pod) -- prepare async-profiler"))
-        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod,
+        let target = "\(pod) -n \(ns)\(Self.containerFlag(container))"
+        let cPrep = beginCommand(kubectlDisplay("exec \(target) -- mkdir -p \(work)"))
+        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod, container: container,
                                         args: ["/bin/sh", "-lc", "rm -rf \(work) && mkdir -p \(work)"], timeoutSeconds: 60) }
         catch { endCommand(cPrep); throw error }
         endCommand(cPrep)
 
-        let cUp = beginCommand(kubectlDisplay("cp async-profiler → \(pod)"))
-        do { try await service.copyToPod(context: ctx, namespace: ns, pod: pod,
+        let cUp = beginCommand(kubectlDisplay("cp\(Self.containerFlag(container)) \(profilerDir).tar \(ns)/\(pod):\(remoteTar)"))
+        do { try await service.copyToPod(context: ctx, namespace: ns, pod: pod, container: container,
                                          localPath: tarLocal, remotePath: remoteTar) }
-        catch { endCommand(cUp); cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: work); throw error }
+        catch { endCommand(cUp); cleanup(); throw error }
         endCommand(cUp)
 
-        let cUnpack = beginCommand(kubectlDisplay("exec \(pod) -- unpack async-profiler"))
-        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod,
+        let cUnpack = beginCommand(kubectlDisplay("exec \(target) -- tar -xf \(remoteTar)"))
+        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod, container: container,
                                         args: ["/bin/sh", "-lc", "tar -xf \(remoteTar) -C \(work) && chmod -R a+rx \(work)"], timeoutSeconds: 120) }
-        catch { endCommand(cUnpack); cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: work); throw error }
+        catch { endCommand(cUnpack); cleanup(); throw error }
         endCommand(cUnpack)
 
         let args = preset.asprofArgs(pid: pid, seconds: seconds, outPath: remoteOut)
-        let cRun = beginCommand(kubectlDisplay("exec \(pod) -- asprof \(preset.rawValue) -d \(seconds)s"))
-        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod,
+        let cRun = beginCommand(kubectlDisplay("exec \(target) -- asprof \(args)"))
+        do { _ = try await service.exec(context: ctx, namespace: ns, pod: pod, container: container,
                                         args: ["/bin/sh", "-lc", "\(asprof) \(args)"], timeoutSeconds: seconds + 120) }
-        catch { endCommand(cRun); cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: work); throw error }
+        catch { endCommand(cRun); cleanup(); throw error }
         endCommand(cRun)
 
         let dir = DiagnosticPaths.profilesDir(ns)
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let localOut = "\(dir)/\(preset.rawValue)-\(ts).jfr"
-        let cDown = beginCommand(kubectlDisplay("cp \(pod):\(remoteOut)"))
-        do { try await service.copyFromPod(context: ctx, namespace: ns, pod: pod,
+        let cDown = beginCommand(kubectlDisplay("cp\(Self.containerFlag(container)) \(ns)/\(pod):\(remoteOut) \(localOut)"))
+        do { try await service.copyFromPod(context: ctx, namespace: ns, pod: pod, container: container,
                                            remotePath: remoteOut, localPath: localOut) }
-        catch { endCommand(cDown); cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: work); throw error }
+        catch { endCommand(cDown); cleanup(); throw error }
         endCommand(cDown)
         // The tar + extracted profiler + JFR (~100MB) are all under `work` — the next
         // run re-uploads anyway, so don't leave them in the pod between runs.
-        cleanupRemote(context: ctx, namespace: ns, pod: pod, paths: work)
+        cleanup()
         return URL(fileURLWithPath: localOut)
     }
 
@@ -851,6 +899,18 @@ final class ClusterViewModel {
     private func endCommand(_ id: Int) {
         inflight.removeAll { $0.id == id }
         onStateChanged?()
+    }
+
+    /// ` -c <name>` for the status-bar text of a container-pinned command ("" for nil).
+    private static func containerFlag(_ container: String?) -> String {
+        container.map { " -c \($0)" } ?? ""
+    }
+
+    /// What `resources(kind:)` actually runs, for the status bar.
+    private static func listCommand(_ kind: ResourceKind) -> String {
+        if kind == .secrets { return "get secrets -A --no-headers" }
+        if kind == .nodes { return "get nodes -o json (+ top nodes)" }
+        return "get \(kind.kubectlResource)\(kind.isNamespaced ? " -A" : "") -o json"
     }
 
     private func kubectlDisplay(_ tail: String) -> String {

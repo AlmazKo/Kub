@@ -62,7 +62,7 @@ final class LiveLogView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
-        filterField.placeholderString = "Filter…"
+        filterField.placeholderString = "Filter"
         filterField.target = self
         filterField.action = #selector(filterChanged)
         filterField.sendsSearchStringImmediately = true
@@ -120,7 +120,7 @@ final class LiveLogView: NSView {
         textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
-        // Lay out only what's on screen — otherwise scrolling a 5k-line log lays out
+        // Lay out only what's on screen — otherwise scrolling a 50k-line log lays out
         // the whole document on the main thread and janks the whole app.
         textView.layoutManager?.allowsNonContiguousLayout = true
 
@@ -235,11 +235,18 @@ final class LiveLogView: NSView {
     }
 
     private func stripTimestamp(_ line: String) -> String {
-        guard let sp = line.firstIndex(of: " ") else { return line }
-        let token = line[line.startIndex..<sp]   // RFC3339Nano, e.g. 2026-07-01T10:05:16.123Z
+        // Multi-container pods stream with `--prefix`: "[pod/<pod>/<container>] <ts> msg" —
+        // the stamp sits after that tag, which must survive.
+        var start = line.startIndex
+        if line.hasPrefix("["), let close = line.firstIndex(of: "]"),
+           let afterTag = line.index(close, offsetBy: 2, limitedBy: line.endIndex) {
+            start = afterTag
+        }
+        guard let sp = line[start...].firstIndex(of: " ") else { return line }
+        let token = line[start..<sp]   // RFC3339Nano, e.g. 2026-07-01T10:05:16.123Z
         guard token.count >= 20, token.first?.isNumber == true, token.contains("T"),
               token.hasSuffix("Z") || token.contains("+") else { return line }
-        return String(line[line.index(after: sp)...])
+        return String(line[..<start]) + String(line[line.index(after: sp)...])
     }
 
     /// Wrap long lines to the view width, or let them run off with a horizontal scroller.

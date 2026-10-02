@@ -1,6 +1,6 @@
 import Foundation
 
-/// async-profiler presets, mirroring profile-async.bash. Output format is JFR.
+/// async-profiler presets (one asprof event config each). Output format is JFR.
 enum AsyncProfile: String, CaseIterable, Sendable {
     case cpu, alloc, wall, lock, native
 
@@ -18,7 +18,9 @@ enum AsyncProfile: String, CaseIterable, Sendable {
     func asprofArgs(pid: String, seconds: Int, outPath: String) -> String {
         switch self {
         case .cpu:    return "-e cpu -i 1ms -t -d \(seconds) -f \(outPath) \(pid)"
-        case .wall:   return "-e wall -i 1ms -t -d \(seconds) -f \(outPath) \(pid)"
+        // Wall mode samples EVERY thread each interval; 1ms on a few hundred threads is
+        // a measurable load on the target — 10ms is the upstream-recommended default.
+        case .wall:   return "-e wall -i 10ms -t -d \(seconds) -f \(outPath) \(pid)"
         case .alloc:  return "-e alloc --alloc 64k -t -d \(seconds) -f \(outPath) \(pid)"
         case .lock:   return "-e lock -t -d \(seconds) -f \(outPath) \(pid)"
         case .native: return "-e nativemem -i 1ms -t -d \(seconds) -f \(outPath) \(pid)"
@@ -47,13 +49,25 @@ enum DiagnosticPaths {
     /// Profiles → /tmp/kub/profiles/<namespace>/.
     static func profilesDir(_ namespace: String) -> String { "/tmp/kub/profiles/\(namespace)" }
 
-    /// async-profiler (linux-x64) ships *inside the app bundle* (Contents/Resources/,
-    /// copied there by build.sh) and is uploaded into the pod per run. The dir name
-    /// must match the tar's top-level folder.
+    /// async-profiler ships *inside the app bundle* (Contents/Resources/, one tar per
+    /// Linux architecture — x64 and arm64/Graviton) and is uploaded into the pod per
+    /// run. The dir name must match the tar's top-level folder.
     static let asyncProfilerVersion = "4.4"
-    static var asyncProfilerDir: String { "async-profiler-\(asyncProfilerVersion)-linux-x64" }
-    static var asyncProfilerTar: URL? {
-        Bundle.main.url(forResource: asyncProfilerDir, withExtension: "tar")
+
+    /// Bundle flavour for a node's `nodeInfo.architecture`; nil = no build for it.
+    /// Unknown (nil) arch assumes amd64, by far the most common.
+    static func asyncProfilerFlavor(arch: String?) -> String? {
+        switch arch ?? "amd64" {
+        case "amd64", "x86_64": return "linux-x64"
+        case "arm64", "aarch64": return "linux-arm64"
+        default: return nil
+        }
+    }
+    static func asyncProfilerDir(arch: String?) -> String? {
+        asyncProfilerFlavor(arch: arch).map { "async-profiler-\(asyncProfilerVersion)-\($0)" }
+    }
+    static func asyncProfilerTar(arch: String?) -> URL? {
+        asyncProfilerDir(arch: arch).flatMap { Bundle.main.url(forResource: $0, withExtension: "tar") }
     }
 }
 

@@ -54,13 +54,13 @@ talks to the cluster through the `kubectl` you already have.
     <td width="50%" valign="top">
       <h3>Live logs and a shell</h3>
       Follow logs with filtering, timestamps and ANSI colours — follow pauses
-      when you scroll up and resumes at the tail. Open an interactive shell in
-      a container.
+      when you scroll up; switch Follow back on to jump to the tail. Open an
+      interactive shell in a container.
     </td>
     <td width="50%" valign="top">
       <h3>Port-forward and metrics</h3>
-      Start port-forwards from a row and manage them from the toolbar. The
-      <em>Metrics</em> tab scrapes a pod's Prometheus endpoint, discovered from
+      Start port-forwards from a pod or service row and manage them from the
+      toolbar. The <em>Metrics</em> tab scrapes a pod's Prometheus endpoint, discovered from
       ServiceMonitors, annotations or port names.
     </td>
   </tr>
@@ -75,8 +75,9 @@ talks to the cluster through the `kubectl` you already have.
       <h3>JVM diagnostics</h3>
       Take a heap dump or an
       <a href="https://github.com/async-profiler/async-profiler">async-profiler</a>
-      flame graph of a Java process straight from the pod's process list, with
-      progress in the toolbar and a notification when it is ready.
+      recording (JFR — a flame graph in IntelliJ IDEA or JDK Mission Control) of
+      a Java process straight from the pod's process list, with progress in the
+      toolbar and a notification when it is ready.
     </td>
   </tr>
 </table>
@@ -95,12 +96,13 @@ never looks like your local minikube.
 </p>
 
 > [!IMPORTANT]
-> **Secret values are never shown.** Secrets and config maps display key counts
-> only; nothing Kub renders on screen contains a secret value.
+> **Secret values are never shown.** Secrets display key counts, names and
+> sizes only, and are read without their values ever reaching the app.
 
 - **Every mutation confirms.** Delete, restart, scale, roll back and diagnostics
   open a confirmation with a live preview of the exact `kubectl` command. On a
-  production context, Return defaults to *Cancel*.
+  production context, Return defaults to *Cancel*; deleting a PVC or PV asks
+  you to type its name.
 - **No telemetry.** No analytics, tracking, account or remote service. Kub talks
   only to your clusters, through `kubectl`, with your credentials.
 - **No leftovers.** Log streams, port-forwards and diagnostics are torn down
@@ -134,7 +136,8 @@ launch works offline.
 
 - macOS 14 Sonoma or newer. Apple Silicon and Intel Macs are supported.
 - [`kubectl`](https://kubernetes.io/docs/tasks/tools/) and a kubeconfig in
-  `~/.kube`. Exec-auth plugins (for example `aws` for EKS) are found in
+  `~/.kube`. Exec-auth plugins (for example `aws` for EKS or
+  `gke-gcloud-auth-plugin`) are found on your login shell's `PATH`, plus
   `/opt/homebrew/bin` and `/usr/local/bin`.
 
 <details>
