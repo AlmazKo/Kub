@@ -1,0 +1,174 @@
+# Payments: a stateful tier with the usual trouble — an OOM-killed worker and a bad image tag.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels: { team: payments }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-gateway
+  namespace: payments
+  labels: { app: payment-gateway, team: payments }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: payment-gateway } }
+  template:
+    metadata:
+      labels: { app: payment-gateway, team: payments }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: payment-gateway
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "/demo/app.sh"]
+          env:
+            - { name: SERVICE, value: payment-gateway }
+            - { name: VERSION, value: "3.8.1" }
+            - { name: PORT, value: "9090" }
+            - { name: ERROR_RATE, value: "7" }
+            - { name: PATHS, value: "/v1/charges /v1/charges/{id} /v1/refunds /v1/webhooks/stripe /healthz" }
+          ports: [{ name: metrics, containerPort: 9090 }]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          volumeMounts: [{ name: demo, mountPath: /demo }]
+      volumes:
+        - name: demo
+          configMap: { name: demo-scripts }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payment-gateway
+  namespace: payments
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-gateway
+  namespace: payments
+spec:
+  selector: { app: payment-gateway }
+  ports: [{ name: metrics, port: 9090, targetPort: metrics }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-db
+  namespace: payments
+spec:
+  clusterIP: None
+  selector: { app: ledger-db }
+  ports: [{ name: redis, port: 6379 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ledger-db
+  namespace: payments
+  labels: { app: ledger-db, team: payments }
+spec:
+  serviceName: ledger-db
+  replicas: 2
+  selector: { matchLabels: { app: ledger-db } }
+  template:
+    metadata:
+      labels: { app: ledger-db, team: payments }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--appendonly", "yes"]
+          ports: [{ name: redis, containerPort: 6379 }]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 128Mi }
+          volumeMounts: [{ name: data, mountPath: /data }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: refund-worker
+  namespace: payments
+  labels: { app: refund-worker, team: payments }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: refund-worker } }
+  template:
+    metadata:
+      labels: { app: refund-worker, team: payments }
+    spec:
+      containers:
+        - name: worker
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "INFO  [refund-worker] loading refund batch 2026-10-01"
+              sleep 6
+              echo "INFO  [refund-worker] materializing 1.2M ledger entries"
+              head -c 419430400 /dev/zero | tail
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 48Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-scorer
+  namespace: payments
+  labels: { app: fraud-scorer, team: payments }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: fraud-scorer } }
+  template:
+    metadata:
+      labels: { app: fraud-scorer, team: payments }
+    spec:
+      containers:
+        - name: model
+          image: registry.acme.example/payments/fraud-scorer:2.4.1
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-db-ingress
+  namespace: payments
+spec:
+  podSelector: { matchLabels: { app: ledger-db } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: payment-gateway } } }]
+      ports: [{ port: 6379 }]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payment-provider-keys
+  namespace: payments
+type: Opaque
+stringData:
+  PROVIDER_API_KEY: demo-not-a-real-key
+  WEBHOOK_SIGNING_SECRET: demo-not-a-real-secret
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-gateway-config
+  namespace: payments
+data:
+  CURRENCIES: EUR,GBP,USD
+  RETRY_LIMIT: "3"
+  SETTLEMENT_CUTOFF: "22:00"

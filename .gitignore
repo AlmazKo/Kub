@@ -1,0 +1,20 @@
+.DS_Store
+.idea/
+.xcbuild/
+build/
+DerivedData/
+**/xcuserdata/
+*.xcuserstate
+*.dmg
+*.zip
+.claude/
+release.sh
+*.local.md
+*.local.json
+Casks/
+
+# Credentials never belong in a public repo, not even untracked in the tree.
+github
+github.pub
+id_*
+*.pem
